@@ -9,7 +9,7 @@ import asyncio
 import logging
 from datetime import datetime
 from hashlib import sha256
-from typing import Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 import pytz
 import aiohttp
@@ -45,8 +45,8 @@ WEATHER_CACHE = int(_require("WEATHER_CACHE"))
 # ── Client & State ─────────────────────────────────────────────────
 
 client = TelegramClient("session", API_ID, API_HASH)
-_http: aiohttp.ClientSession | None = None
-_weather_cache: tuple[float, Dict[str, Any]] = (0.0, {})
+_http: Optional[aiohttp.ClientSession] = None
+_weather_cache: Tuple[float, Dict[str, Any]] = (0.0, {})
 _last_bio = ""
 
 # ── Helpers ─────────────────────────────────────────────────────────
@@ -72,7 +72,7 @@ async def close_http() -> None:
         await _http.close()
         _http = None
 
-async def download_replied_file(e) -> tuple | None:
+async def download_replied_file(e) -> Optional[tuple]:
     if not e.is_reply:
         await e.edit("⚠️ Reply to a file.")
         return None
