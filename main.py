@@ -78,7 +78,7 @@ async def safe_edit(e, text: str) -> None:
     except Exception as exc:
         logging.warning("safe_edit: %s", exc)
 
-async def _reply(e, text: str, delay: float = 1.0) -> None:
+async def _reply(e, text: str, delay: float = 0.0) -> None:
     await safe_edit(e, text)
     if delay > 0:
         await asyncio.sleep(delay)
@@ -110,7 +110,6 @@ def sha256_file(path: str, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 async def get_file(e) -> Optional[str]:
-    """Download file from replied message. Returns local path or None."""
     if not e.is_reply:
         await _reply(e, "Reply to a file.")
         return None
@@ -247,12 +246,9 @@ HELP = "\n".join([
     "",
     f"`{PREFIX}help`    — commands list",
     f"`{PREFIX}ping`    — latency",
-    f"`{PREFIX}id`      — chat / user ID",
-    f"`{PREFIX}info`    — user info (reply or self)",
     f"`{PREFIX}uptime`  — bot uptime",
     f"`{PREFIX}del`     — delete replied msg",
     f"`{PREFIX}purge <n>` — bulk delete",
-    f"`{PREFIX}copy`    — copy replied msg content",
     f"`{PREFIX}virus`   — VirusTotal lookup",
     f"`{PREFIX}rebio`   — force bio update",
     f"`{PREFIX}reload`  — restart bot",
@@ -275,50 +271,14 @@ async def cmd_help(e):
 async def cmd_ping(e):
     t0 = time.perf_counter()
     await e.edit("…")
-    await _reply(e, f"{int((time.perf_counter() - t0) * 1000)} ms")
-
-@client.on(events.NewMessage(pattern=pat("id"), outgoing=True))
-async def cmd_id(e):
-    if e.is_reply:
-        r = await e.get_reply_message()
-        await _reply(e, f"chat: `{e.chat_id}`\nuser: `{r.sender_id}`")
-    else:
-        await _reply(e, f"chat: `{e.chat_id}`")
-
-@client.on(events.NewMessage(pattern=pat("info"), outgoing=True))
-async def cmd_info(e):
-    target = await e.get_reply_message() if e.is_reply else None
-    user   = await client.get_entity(target.sender_id if target else "me")
-    name   = " ".join(filter(None, [user.first_name, user.last_name]))
-    lines  = [f"**{name}**"]
-    if user.username:
-        lines.append(f"@{user.username}")
-    lines.append(f"ID: `{user.id}`")
-    if getattr(user, "phone", None):
-        lines.append(f"Phone: `{user.phone}`")
-    if getattr(user, "about", None):
-        lines.append(user.about)
-    await _reply(e, "\n".join(lines))
+    ms = int((time.perf_counter() - t0) * 1000)
+    await _reply(e, f"{ms} ms")
 
 @client.on(events.NewMessage(pattern=pat("uptime"), outgoing=True))
 async def cmd_uptime(e):
     h, r = divmod(int(time.time() - _start_time), 3600)
     m, s = divmod(r, 60)
     await _reply(e, f"Uptime: `{h:02d}:{m:02d}:{s:02d}`")
-
-@client.on(events.NewMessage(pattern=pat("copy"), outgoing=True))
-async def cmd_copy(e):
-    if not e.is_reply:
-        return await _reply(e, "Reply to a message to copy.")
-    r = await e.get_reply_message()
-    try:
-        await e.delete()
-    except Exception:
-        pass
-    if r.media:
-        await client.send_file(e.chat_id, r.media, caption=r.raw_text or "")
-    else:
-        await client.send_message(e.chat_id, r.raw_text or "", formatting_entities=r.entities)
 
 @client.on(events.NewMessage(pattern=pat("del"), outgoing=True))
 async def cmd_del(e):
@@ -426,7 +386,7 @@ async def cmd_save(e):
     if not r:
         return await _reply(e, "Cannot get replied message.")
 
-    name     = " ".join(arg.split())
+    name     = " ".join(" ".join(arg.split()).splitlines())
     norm     = _normalize(name)
     tag_line = f"{NOTE_TAG} {name}"
 
@@ -527,9 +487,9 @@ async def cmd_rename(e):
     entry    = _notes_index.get(old_norm)
 
     if not entry:
-        return await _reply(e, f"Note `{old_name}` not found.")
+        return await _reply(e, f"Note `{_esc(old_name)}` not found.")
     if new_norm in _notes_index:
-        return await _reply(e, f"Note `{new_name}` already exists.")
+        return await _reply(e, f"Note `{_esc(new_name)}` already exists.")
 
     _notes_index.pop(old_norm)
     _notes_index[new_norm] = {"id": entry["id"], "name": new_name}
@@ -586,7 +546,13 @@ def _handle_signal():
     asyncio.create_task(_shutdown())
 
 async def main() -> None:
-    await client.start()
+    logging.info("Starting client…")
+    try:
+        await asyncio.wait_for(client.start(), timeout=30)
+    except asyncio.TimeoutError:
+        logging.error("client.start() timed out — check session / network")
+        return
+
     me = await client.get_me()
     logging.info("Started - @%s (%s)", me.username or me.first_name, me.id)
     _load_notes_index()
