@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 import asyncio
 import json
@@ -20,7 +21,9 @@ from telethon import TelegramClient, events
 from telethon.errors import MessageNotModifiedError
 from telethon.tl.functions.account import UpdateProfileRequest
 
-# ── Config ───────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Logging / Env
+# ─────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -35,34 +38,44 @@ def _require(key: str) -> str:
         sys.exit(1)
     return val
 
-API_ID           = int(_require("API_ID"))
-API_HASH         = _require("API_HASH")
-PREFIX           = _require("PREFIX")
-CITY             = _require("CITY")
-TZ               = pytz.timezone(_require("TZ"))
-OW_KEY           = os.getenv("OW_KEY", "").strip()
-VT_KEY           = os.getenv("VT_KEY", "").strip()
+API_ID = int(_require("API_ID"))
+API_HASH = _require("API_HASH")
+PREFIX = _require("PREFIX")
+CITY = _require("CITY")
+TZ = pytz.timezone(_require("TZ"))
+OW_KEY = os.getenv("OW_KEY", "").strip()
+VT_KEY = os.getenv("VT_KEY", "").strip()
 PROFILE_INTERVAL = int(_require("PROFILE_INTERVAL"))
-WEATHER_CACHE    = int(_require("WEATHER_CACHE"))
+WEATHER_CACHE = int(_require("WEATHER_CACHE"))
 
-# ── Client & State ───────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Globals
+# ─────────────────────────────────────────────────────────────
 
 client = TelegramClient("session", API_ID, API_HASH)
+
 _http: Optional[aiohttp.ClientSession] = None
 _weather_cache: tuple[float, Optional[dict[str, Any]]] = (0.0, None)
-_weather_lock   = asyncio.Lock()
-_last_bio       = ""
-_profile_errors = 0
-_shutting_down  = False
-_start_time     = time.time()
+_weather_lock = asyncio.Lock()
 
-# ── Helpers ──────────────────────────────────────────────────────────
+_last_bio = ""
+_profile_errors = 0
+_shutting_down = False
+_start_time = time.time()
+
+NOTE_TAG = "📌"
+NOTES_INDEX_FILE = "notes_index.json"
+_notes_index: dict[str, dict[str, Any]] = {}
+
+# ─────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────
 
 def pat(cmd: str) -> str:
     return rf"^{re.escape(PREFIX)}{cmd}\b(?:\s+([\s\S]+))?$"
 
 def clamp(s: str, n: int) -> str:
-    return s if len(s) <= n else s[:n - 1] + "…"
+    return s if len(s) <= n else s[: n - 1] + "…"
 
 def _normalize(name: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", name).casefold().split())
@@ -109,21 +122,9 @@ def sha256_file(path: str, chunk: int = 1 << 20) -> str:
             h.update(block)
     return h.hexdigest()
 
-async def get_file(e) -> Optional[str]:
-    if not e.is_reply:
-        await _reply(e, "Reply to a file.")
-        return None
-    r = await e.get_reply_message()
-    if not r.file:
-        await _reply(e, "No file in reply.")
-        return None
-    path = await r.download_media()
-    if not path:
-        await _reply(e, "Download failed.")
-        return None
-    return path
-
-# ── Weather & Bio ────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Weather / Bio
+# ─────────────────────────────────────────────────────────────
 
 async def fetch_weather() -> dict[str, Any]:
     if not OW_KEY:
@@ -158,10 +159,10 @@ async def fetch_weather() -> dict[str, Any]:
                 result = {
                     "icon": icon,
                     "temp": round(float(m["temp"])),
-                    "hum":  int(m["humidity"]),
+                    "hum": int(m["humidity"]),
                     "wind": float(data.get("wind", {}).get("speed", 0)),
-                    "sr":   datetime.fromtimestamp(data["sys"]["sunrise"], TZ).strftime("%H:%M"),
-                    "ss":   datetime.fromtimestamp(data["sys"]["sunset"],  TZ).strftime("%H:%M"),
+                    "sr": datetime.fromtimestamp(data["sys"]["sunrise"], TZ).strftime("%H:%M"),
+                    "ss": datetime.fromtimestamp(data["sys"]["sunset"], TZ).strftime("%H:%M"),
                 }
         except Exception as exc:
             logging.warning("Weather fetch: %s", exc)
@@ -180,6 +181,7 @@ def build_bio(w: dict[str, Any]) -> str:
 
 async def profile_loop() -> None:
     global _last_bio, _profile_errors
+
     await asyncio.sleep(5)
     while True:
         try:
@@ -196,11 +198,9 @@ async def profile_loop() -> None:
         backoff = min(30 * (2 ** (_profile_errors - 1)), 1800) if _profile_errors else PROFILE_INTERVAL
         await asyncio.sleep(backoff)
 
-# ── Notes Index ──────────────────────────────────────────────────────
-
-NOTE_TAG         = "📌"
-NOTES_INDEX_FILE = "notes_index.json"
-_notes_index: dict[str, dict[str, Any]] = {}
+# ─────────────────────────────────────────────────────────────
+# Notes index
+# ─────────────────────────────────────────────────────────────
 
 def _load_notes_index() -> None:
     global _notes_index
@@ -227,7 +227,7 @@ async def _rebuild_notes_index() -> None:
         raw = msg.raw_text or ""
         if raw.startswith(NOTE_TAG) and msg.reply_to:
             shown = raw[len(NOTE_TAG):].strip()
-            norm  = _normalize(shown)
+            norm = _normalize(shown)
             if norm and norm not in _notes_index:
                 _notes_index[norm] = {"id": msg.reply_to.reply_to_msg_id, "name": shown}
                 if len(_notes_index) >= 500:
@@ -239,33 +239,35 @@ async def _ensure_index() -> None:
     if not _notes_index:
         await _rebuild_notes_index()
 
-# ── Help ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Commands
+# ─────────────────────────────────────────────────────────────
 
-HELP = "\n".join([
-    f"**Selfbot** (`{PREFIX}`)",
-    "",
-    f"`{PREFIX}help`    — commands list",
-    f"`{PREFIX}ping`    — latency",
-    f"`{PREFIX}uptime`  — bot uptime",
-    f"`{PREFIX}del`     — delete replied msg",
-    f"`{PREFIX}purge <n>` — bulk delete",
-    f"`{PREFIX}virus`   — VirusTotal lookup",
-    f"`{PREFIX}rebio`   — force bio update",
-    f"`{PREFIX}reload`  — restart bot",
-    "",
-    "**Save / Send:**",
-    f"`{PREFIX}save <name>`          — save replied msg",
-    f"`{PREFIX}saved`                — list saved notes",
-    f"`{PREFIX}get <name>`           — forward saved note",
-    f"`{PREFIX}delnote <name>`       — delete a saved note",
-    f"`{PREFIX}rename <old> | <new>` — rename a saved note",
-])
-
-# ── Commands ─────────────────────────────────────────────────────────
+HELP = "\n".join(
+    [
+        f"**Selfbot** (`{PREFIX}`)",
+        "",
+        f"`{PREFIX}help`    — commands list",
+        f"`{PREFIX}ping`    — latency",
+        f"`{PREFIX}uptime`  — bot uptime",
+        f"`{PREFIX}del`     — delete replied msg",
+        f"`{PREFIX}purge <n>` — bulk delete",
+        f"`{PREFIX}virus`   — VirusTotal lookup",
+        f"`{PREFIX}rebio`   — force bio update",
+        f"`{PREFIX}reload`  — restart bot",
+        "",
+        "**Save / Send:**",
+        f"`{PREFIX}save <name>`          — save replied msg",
+        f"`{PREFIX}saved`                — list saved notes",
+        f"`{PREFIX}get <name>`           — forward saved note",
+        f"`{PREFIX}delnote <name>`       — delete a saved note",
+        f"`{PREFIX}rename <old> | <new>` — rename a saved note",
+    ]
+)
 
 @client.on(events.NewMessage(pattern=pat("help"), outgoing=True))
 async def cmd_help(e):
-    await _reply(e, HELP, delay=0)
+    await _reply(e, HELP)
 
 @client.on(events.NewMessage(pattern=pat("ping"), outgoing=True))
 async def cmd_ping(e):
@@ -299,7 +301,7 @@ async def cmd_purge(e):
     except ValueError:
         return await _reply(e, f"Usage: {PREFIX}purge <number>")
 
-    ids = []
+    ids: list[int] = []
     async for msg in client.iter_messages(e.chat_id, limit=min(2000, n * 8)):
         if msg.out and msg.id != e.id:
             ids.append(msg.id)
@@ -317,9 +319,16 @@ async def cmd_purge(e):
 async def cmd_virus(e):
     if not VT_KEY:
         return await _reply(e, "VT_KEY not set.")
-    path = await get_file(e)
+    if not e.is_reply:
+        return await _reply(e, "Reply to a file.")
+
+    r = await e.get_reply_message()
+    if not r.file:
+        return await _reply(e, "No file in reply.")
+
+    path = await r.download_media()
     if not path:
-        return
+        return await _reply(e, "Download failed.")
 
     try:
         await e.edit("Scanning…")
@@ -346,7 +355,7 @@ async def cmd_virus(e):
     if "data" not in data:
         return await _reply(e, f"Not found on VT\n`{h}`")
 
-    st  = data["data"]["attributes"]["last_analysis_stats"]
+    st = data["data"]["attributes"]["last_analysis_stats"]
     mal = st.get("malicious", 0)
     sus = st.get("suspicious", 0)
     und = st.get("undetected", 0)
@@ -372,8 +381,6 @@ async def cmd_reload(e):
     await close_http()
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
-# ── Save & Send Commands ─────────────────────────────────────────────
-
 @client.on(events.NewMessage(pattern=pat("save"), outgoing=True))
 async def cmd_save(e):
     arg = (e.pattern_match.group(1) or "").strip()
@@ -386,15 +393,18 @@ async def cmd_save(e):
     if not r:
         return await _reply(e, "Cannot get replied message.")
 
-    name     = " ".join(" ".join(arg.split()).splitlines())
-    norm     = _normalize(name)
+    name = " ".join(arg.split())
+    norm = _normalize(name)
     tag_line = f"{NOTE_TAG} {name}"
 
     await _ensure_index()
 
     if norm in _notes_index:
         show = _esc((_notes_index[norm].get("name") or name).replace("\n", " "))
-        return await _reply(e, f"Note `{show}` already exists.\nDelete first: `{PREFIX}delnote {show}`")
+        return await _reply(
+            e,
+            f"Note `{show}` already exists.\nDelete first: `{PREFIX}delnote {show}`",
+        )
 
     try:
         try:
@@ -404,8 +414,12 @@ async def cmd_save(e):
                 path = await r.download_media()
                 if path:
                     try:
-                        msg = await client.send_file("me", path, caption=r.raw_text or "",
-                                                     formatting_entities=list(r.entities or []) or None)
+                        msg = await client.send_file(
+                            "me",
+                            path,
+                            caption=r.raw_text or "",
+                            formatting_entities=r.entities or None,
+                        )
                     finally:
                         try:
                             os.remove(path)
@@ -414,8 +428,11 @@ async def cmd_save(e):
                 else:
                     msg = await client.send_message("me", r.raw_text or "[media failed]")
             else:
-                msg = await client.send_message("me", r.raw_text or "[empty]",
-                                                formatting_entities=list(r.entities or []) or None)
+                msg = await client.send_message(
+                    "me",
+                    r.raw_text or "[empty]",
+                    formatting_entities=r.entities or None,
+                )
 
         await client.send_message("me", tag_line, reply_to=msg.id)
         _notes_index[norm] = {"id": msg.id, "name": name}
@@ -440,7 +457,7 @@ async def cmd_saved(e):
         if len(items) > 80:
             lines.append(f"\nShowing 80/{len(items)}")
         lines.append(f"\nTotal: {len(items)}  —  `{PREFIX}get <name>` to send")
-        await _reply(e, "\n".join(lines), delay=0)
+        await _reply(e, "\n".join(lines))
     except Exception as exc:
         await _reply(e, f"Error: {exc}")
 
@@ -484,7 +501,7 @@ async def cmd_rename(e):
 
     old_norm = _normalize(old_name)
     new_norm = _normalize(new_name)
-    entry    = _notes_index.get(old_norm)
+    entry = _notes_index.get(old_norm)
 
     if not entry:
         return await _reply(e, f"Note `{_esc(old_name)}` not found.")
@@ -498,7 +515,11 @@ async def cmd_rename(e):
     try:
         async for msg in client.iter_messages("me", limit=2000):
             raw = msg.raw_text or ""
-            if raw.startswith(NOTE_TAG) and msg.reply_to and msg.reply_to.reply_to_msg_id == entry["id"]:
+            if (
+                raw.startswith(NOTE_TAG)
+                and msg.reply_to
+                and msg.reply_to.reply_to_msg_id == entry["id"]
+            ):
                 await msg.edit(f"{NOTE_TAG} {new_name}")
                 break
     except Exception:
@@ -513,7 +534,7 @@ async def cmd_delnote(e):
     if not arg:
         return await _reply(e, f"Usage: `{PREFIX}delnote <name>`")
 
-    norm  = _normalize(arg)
+    norm = _normalize(arg)
     entry = _notes_index.pop(norm, None)
     if not entry:
         return await _reply(e, f"Note `{_esc(arg)}` not found.")
@@ -522,7 +543,11 @@ async def cmd_delnote(e):
     try:
         async for msg in client.iter_messages("me", limit=2000):
             raw = msg.raw_text or ""
-            if raw.startswith(NOTE_TAG) and msg.reply_to and msg.reply_to.reply_to_msg_id == entry["id"]:
+            if (
+                raw.startswith(NOTE_TAG)
+                and msg.reply_to
+                and msg.reply_to.reply_to_msg_id == entry["id"]
+            ):
                 await msg.delete()
                 break
         await client.delete_messages("me", [entry["id"]])
@@ -531,7 +556,9 @@ async def cmd_delnote(e):
 
     await _reply(e, f"Deleted: `{_esc(arg)}`")
 
-# ── Entry ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Shutdown / Main
+# ─────────────────────────────────────────────────────────────
 
 async def _shutdown() -> None:
     global _shutting_down
@@ -542,19 +569,15 @@ async def _shutdown() -> None:
     await close_http()
     await client.disconnect()
 
-def _handle_signal():
+def _handle_signal() -> None:
     asyncio.create_task(_shutdown())
 
 async def main() -> None:
     logging.info("Starting client…")
-    try:
-        await asyncio.wait_for(client.start(), timeout=30)
-    except asyncio.TimeoutError:
-        logging.error("client.start() timed out — check session / network")
-        return
-
+    await client.start()
     me = await client.get_me()
     logging.info("Started - @%s (%s)", me.username or me.first_name, me.id)
+
     _load_notes_index()
 
     loop = asyncio.get_running_loop()
@@ -564,7 +587,7 @@ async def main() -> None:
             try:
                 loop.add_signal_handler(sig, _handle_signal)
             except NotImplementedError:
-                pass  # Windows
+                pass
 
     bg = asyncio.create_task(profile_loop())
     try:
@@ -574,4 +597,8 @@ async def main() -> None:
         await close_http()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        pass
