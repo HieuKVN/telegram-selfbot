@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 import asyncio
 import json
@@ -21,7 +20,7 @@ from telethon import TelegramClient, events
 from telethon.errors import MessageNotModifiedError
 from telethon.tl.functions.account import UpdateProfileRequest
 
-# ── Config ──────────────────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -65,10 +64,10 @@ def pat(cmd: str) -> str:
 def clamp(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n - 1] + "…"
 
-def _normalize_name(name: str) -> str:
+def _normalize(name: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", name).casefold().split())
 
-def _escape_md(s: str) -> str:
+def _esc(s: str) -> str:
     return s.replace("`", "｀")
 
 async def safe_edit(e, text: str) -> None:
@@ -80,7 +79,6 @@ async def safe_edit(e, text: str) -> None:
         logging.warning("safe_edit: %s", exc)
 
 async def _reply(e, text: str, delay: float = 1.0) -> None:
-    """Edit message with text, then delete after delay seconds."""
     await safe_edit(e, text)
     if delay > 0:
         await asyncio.sleep(delay)
@@ -104,14 +102,15 @@ async def close_http() -> None:
         await _http.close()
         _http = None
 
-def sha256_file(path: str, chunk_size: int = 1 << 20) -> str:
+def sha256_file(path: str, chunk: int = 1 << 20) -> str:
     h = sha256()
     with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(chunk_size), b""):
-            h.update(chunk)
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
     return h.hexdigest()
 
-async def download_replied_file(e) -> Optional[tuple[Any, str]]:
+async def get_file(e) -> Optional[str]:
+    """Download file from replied message. Returns local path or None."""
     if not e.is_reply:
         await _reply(e, "Reply to a file.")
         return None
@@ -123,14 +122,9 @@ async def download_replied_file(e) -> Optional[tuple[Any, str]]:
     if not path:
         await _reply(e, "Download failed.")
         return None
-    return r, path
+    return path
 
 # ── Weather & Bio ────────────────────────────────────────────────────
-
-def _cloud_icon(c: int) -> str:
-    if c < 20:
-        return "☀️"
-    return "⛅" if c < 60 else "☁️"
 
 async def fetch_weather() -> dict[str, Any]:
     if not OW_KEY:
@@ -159,9 +153,11 @@ async def fetch_weather() -> dict[str, Any]:
                 logging.warning("Weather API: %s", data.get("message", data.get("cod")))
                 result: dict[str, Any] = {"_fail": True}
             else:
+                c = data.get("clouds", {}).get("all", 0)
+                icon = "☀️" if c < 20 else ("⛅" if c < 60 else "☁️")
                 m = data["main"]
                 result = {
-                    "icon": _cloud_icon(data.get("clouds", {}).get("all", 0)),
+                    "icon": icon,
                     "temp": round(float(m["temp"])),
                     "hum":  int(m["humidity"]),
                     "wind": float(data.get("wind", {}).get("speed", 0)),
@@ -201,7 +197,7 @@ async def profile_loop() -> None:
         backoff = min(30 * (2 ** (_profile_errors - 1)), 1800) if _profile_errors else PROFILE_INTERVAL
         await asyncio.sleep(backoff)
 
-# ── Notes Index (RAM cache + JSON persistence) ───────────────────────
+# ── Notes Index ──────────────────────────────────────────────────────
 
 NOTE_TAG         = "📌"
 NOTES_INDEX_FILE = "notes_index.json"
@@ -215,13 +211,7 @@ def _load_notes_index() -> None:
             return
         with open(NOTES_INDEX_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, dict) and data and all(isinstance(v, int) for v in data.values()):
-            _notes_index = {}
-            _save_notes_index()
-        elif isinstance(data, dict):
-            _notes_index = data
-        else:
-            _notes_index = {}
+        _notes_index = data if isinstance(data, dict) else {}
     except Exception:
         _notes_index = {}
 
@@ -233,19 +223,22 @@ def _save_notes_index() -> None:
         logging.warning("Failed to save notes index: %s", exc)
 
 async def _rebuild_notes_index() -> None:
-    global _notes_index
     _notes_index.clear()
     async for msg in client.iter_messages("me", limit=3000):
         raw = msg.raw_text or ""
         if raw.startswith(NOTE_TAG) and msg.reply_to:
             shown = raw[len(NOTE_TAG):].strip()
-            norm  = _normalize_name(shown)
+            norm  = _normalize(shown)
             if norm and norm not in _notes_index:
                 _notes_index[norm] = {"id": msg.reply_to.reply_to_msg_id, "name": shown}
                 if len(_notes_index) >= 500:
                     break
     _save_notes_index()
     logging.info("Notes index rebuilt: %d notes", len(_notes_index))
+
+async def _ensure_index() -> None:
+    if not _notes_index:
+        await _rebuild_notes_index()
 
 # ── Help ─────────────────────────────────────────────────────────────
 
@@ -309,9 +302,8 @@ async def cmd_info(e):
 
 @client.on(events.NewMessage(pattern=pat("uptime"), outgoing=True))
 async def cmd_uptime(e):
-    delta = int(time.time() - _start_time)
-    h, rem = divmod(delta, 3600)
-    m, s   = divmod(rem, 60)
+    h, r = divmod(int(time.time() - _start_time), 3600)
+    m, s = divmod(r, 60)
     await _reply(e, f"Uptime: `{h:02d}:{m:02d}:{s:02d}`")
 
 @client.on(events.NewMessage(pattern=pat("copy"), outgoing=True))
@@ -365,10 +357,9 @@ async def cmd_purge(e):
 async def cmd_virus(e):
     if not VT_KEY:
         return await _reply(e, "VT_KEY not set.")
-    result = await download_replied_file(e)
-    if not result:
+    path = await get_file(e)
+    if not path:
         return
-    _, path = result
 
     try:
         await e.edit("Scanning…")
@@ -399,7 +390,7 @@ async def cmd_virus(e):
     mal = st.get("malicious", 0)
     sus = st.get("suspicious", 0)
     und = st.get("undetected", 0)
-    verdict = "Clean" if (mal == 0 and sus == 0) else "Detected"
+    verdict = "Clean" if mal == 0 and sus == 0 else "Detected"
     await _reply(e, f"{verdict}  mal:`{mal}` sus:`{sus}` und:`{und}`\n`{h}`")
 
 @client.on(events.NewMessage(pattern=pat("rebio"), outgoing=True))
@@ -436,54 +427,40 @@ async def cmd_save(e):
         return await _reply(e, "Cannot get replied message.")
 
     name     = " ".join(arg.split())
-    norm     = _normalize_name(name)
+    norm     = _normalize(name)
     tag_line = f"{NOTE_TAG} {name}"
 
-    if not _notes_index:
-        await _rebuild_notes_index()
+    await _ensure_index()
 
     if norm in _notes_index:
-        show = _escape_md((_notes_index[norm].get("name") or name).replace("\n", " "))
-        return await _reply(
-            e,
-            f"Note `{show}` already exists.\n"
-            f"Delete first: `{PREFIX}delnote {show}`",
-        )
+        show = _esc((_notes_index[norm].get("name") or name).replace("\n", " "))
+        return await _reply(e, f"Note `{show}` already exists.\nDelete first: `{PREFIX}delnote {show}`")
 
     try:
-        content_msg = None
         try:
-            content_msg = await r.forward_to("me")
+            msg = await r.forward_to("me")
         except Exception:
             if r.media:
                 path = await r.download_media()
                 if path:
-                    raw  = r.raw_text or ""
-                    ents = list(r.entities or [])
                     try:
-                        content_msg = await client.send_file(
-                            "me", path, caption=raw or "",
-                            formatting_entities=ents or None)
+                        msg = await client.send_file("me", path, caption=r.raw_text or "",
+                                                     formatting_entities=list(r.entities or []) or None)
                     finally:
                         try:
                             os.remove(path)
                         except OSError:
                             pass
                 else:
-                    content_msg = await client.send_message("me", r.raw_text or "[media failed]")
+                    msg = await client.send_message("me", r.raw_text or "[media failed]")
             else:
-                raw  = r.raw_text or ""
-                ents = list(r.entities or [])
-                content_msg = await client.send_message(
-                    "me", raw or "[empty]",
-                    formatting_entities=ents or None)
+                msg = await client.send_message("me", r.raw_text or "[empty]",
+                                                formatting_entities=list(r.entities or []) or None)
 
-        if content_msg:
-            await client.send_message("me", tag_line, reply_to=content_msg.id)
-            _notes_index[norm] = {"id": content_msg.id, "name": name}
-            _save_notes_index()
-
-        await _reply(e, f"Saved: `{_escape_md(name)}`")
+        await client.send_message("me", tag_line, reply_to=msg.id)
+        _notes_index[norm] = {"id": msg.id, "name": name}
+        _save_notes_index()
+        await _reply(e, f"Saved: `{_esc(name)}`")
     except Exception as exc:
         await _reply(e, f"Save failed: {exc}")
 
@@ -494,77 +471,59 @@ async def cmd_saved(e):
             await e.edit("Rebuilding index…")
             await _rebuild_notes_index()
         if not _notes_index:
-            return await _reply(e, f"No saved notes. Use `{PREFIX}save <name>` to save.")
+            return await _reply(e, f"No saved notes. Use `{PREFIX}save <name>`.")
 
-        items    = sorted(_notes_index.values(), key=lambda x: _normalize_name(x.get("name", "")))
-        max_show = 80
-        lines    = ["**Saved Notes:**\n"]
-        for it in items[:max_show]:
-            lines.append(f"• `{_escape_md(it.get('name', '') or '')}`")
-        if len(items) > max_show:
-            lines.append(f"\nShowing {max_show}/{len(items)}")
-        lines.append(f"\nTotal: {len(items)}")
-        lines.append(f"Use `{PREFIX}get <name>` to send")
+        items = sorted(_notes_index.values(), key=lambda x: _normalize(x.get("name", "")))
+        lines = ["**Saved Notes:**\n"]
+        for it in items[:80]:
+            lines.append(f"• `{_esc(it.get('name', '') or '')}`")
+        if len(items) > 80:
+            lines.append(f"\nShowing 80/{len(items)}")
+        lines.append(f"\nTotal: {len(items)}  —  `{PREFIX}get <name>` to send")
         await _reply(e, "\n".join(lines), delay=0)
     except Exception as exc:
         await _reply(e, f"Error: {exc}")
 
 @client.on(events.NewMessage(pattern=pat("get"), outgoing=True))
 async def cmd_get(e):
-    if not _notes_index:
-        await _rebuild_notes_index()
-
+    await _ensure_index()
     arg = (e.pattern_match.group(1) or "").strip()
     if not arg:
         return await _reply(e, f"Usage: `{PREFIX}get <name>`")
 
-    norm    = _normalize_name(arg)
-    chat_id = e.chat_id
+    norm = _normalize(arg)
+    entry = _notes_index.get(norm)
+    if not entry:
+        await _rebuild_notes_index()
+        entry = _notes_index.get(norm)
+    if not entry:
+        return await _reply(e, f"Note `{_esc(arg)}` not found.")
+
+    msg = await client.get_messages("me", ids=entry["id"])
+    if not msg:
+        _notes_index.pop(norm, None)
+        _save_notes_index()
+        return await _reply(e, "Content message was deleted.")
 
     try:
-        entry  = _notes_index.get(norm)
-        msg_id = entry["id"] if entry else None
-
-        if msg_id is None:
-            await _rebuild_notes_index()
-            entry  = _notes_index.get(norm)
-            msg_id = entry["id"] if entry else None
-
-        if msg_id is None:
-            return await _reply(e, f"Note `{_escape_md(arg)}` not found.")
-
-        content_msg = await client.get_messages("me", ids=msg_id)
-        if not content_msg:
-            _notes_index.pop(norm, None)
-            _save_notes_index()
-            return await _reply(e, "Content message was deleted.")
-
-        try:
-            await e.delete()
-        except Exception:
-            pass
-        await content_msg.forward_to(chat_id)
-    except Exception as exc:
-        try:
-            await _reply(e, f"Send failed: {exc}")
-        except Exception:
-            logging.warning("cmd_get error: %s", exc)
+        await e.delete()
+    except Exception:
+        pass
+    await msg.forward_to(e.chat_id)
 
 @client.on(events.NewMessage(pattern=pat("rename"), outgoing=True))
 async def cmd_rename(e):
-    if not _notes_index:
-        await _rebuild_notes_index()
-
+    await _ensure_index()
     arg = (e.pattern_match.group(1) or "").strip()
     if "|" not in arg:
-        return await _reply(e, f"Usage: `{PREFIX}rename old name | new name`")
+        return await _reply(e, f"Usage: `{PREFIX}rename old | new`")
 
     old_name, new_name = (p.strip() for p in arg.split("|", 1))
     if not old_name or not new_name:
         return await _reply(e, "Both old and new names required.")
 
-    old_norm = _normalize_name(old_name)
-    new_norm = _normalize_name(new_name)
+    old_norm = _normalize(old_name)
+    new_norm = _normalize(new_name)
     entry    = _notes_index.get(old_norm)
 
     if not entry:
@@ -572,7 +531,7 @@ async def cmd_rename(e):
     if new_norm in _notes_index:
         return await _reply(e, f"Note `{new_name}` already exists.")
 
-    _notes_index.pop(old_norm, None)
+    _notes_index.pop(old_norm)
     _notes_index[new_norm] = {"id": entry["id"], "name": new_name}
     _save_notes_index()
 
@@ -585,37 +544,32 @@ async def cmd_rename(e):
     except Exception:
         pass
 
-    await _reply(e, f"Renamed `{_escape_md(old_name)}` → `{_escape_md(new_name)}`")
+    await _reply(e, f"Renamed `{_esc(old_name)}` → `{_esc(new_name)}`")
 
 @client.on(events.NewMessage(pattern=pat("delnote"), outgoing=True))
 async def cmd_delnote(e):
-    if not _notes_index:
-        await _rebuild_notes_index()
-
+    await _ensure_index()
     arg = (e.pattern_match.group(1) or "").strip()
     if not arg:
         return await _reply(e, f"Usage: `{PREFIX}delnote <name>`")
 
-    norm   = _normalize_name(arg)
-    entry  = _notes_index.pop(norm, None)
-    msg_id = entry["id"] if entry else None
-
-    if msg_id is None:
-        return await _reply(e, f"Note `{_escape_md(arg)}` not found.")
+    norm  = _normalize(arg)
+    entry = _notes_index.pop(norm, None)
+    if not entry:
+        return await _reply(e, f"Note `{_esc(arg)}` not found.")
 
     _save_notes_index()
-
     try:
         async for msg in client.iter_messages("me", limit=2000):
             raw = msg.raw_text or ""
-            if raw.startswith(NOTE_TAG) and msg.reply_to and msg.reply_to.reply_to_msg_id == msg_id:
+            if raw.startswith(NOTE_TAG) and msg.reply_to and msg.reply_to.reply_to_msg_id == entry["id"]:
                 await msg.delete()
                 break
-        await client.delete_messages("me", [msg_id])
+        await client.delete_messages("me", [entry["id"]])
     except Exception:
         pass
 
-    await _reply(e, f"Deleted: `{_escape_md(arg)}`")
+    await _reply(e, f"Deleted: `{_esc(arg)}`")
 
 # ── Entry ─────────────────────────────────────────────────────────────
 
@@ -635,7 +589,6 @@ async def main() -> None:
     await client.start()
     me = await client.get_me()
     logging.info("Started - @%s (%s)", me.username or me.first_name, me.id)
-
     _load_notes_index()
 
     loop = asyncio.get_running_loop()
