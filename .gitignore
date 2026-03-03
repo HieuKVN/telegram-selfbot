@@ -22,6 +22,9 @@ venv/
 *.swp
 *.swo
 
+# Saved messages
+saved_messages/
+
 # OS
 Thumbs.db
 Desktop.ini
