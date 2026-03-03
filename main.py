@@ -12,7 +12,7 @@ import time
 import unicodedata
 from datetime import datetime
 from hashlib import sha256
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional
 
 import aiohttp
 import pytz
@@ -36,68 +36,39 @@ def _require(key: str) -> str:
         sys.exit(1)
     return val
 
-API_ID = int(_require("API_ID"))
-API_HASH = _require("API_HASH")
-PREFIX = _require("PREFIX")
-CITY = _require("CITY")
-TZ = pytz.timezone(_require("TZ"))
-OW_KEY = os.getenv("OW_KEY", "").strip()
-VT_KEY = os.getenv("VT_KEY", "").strip()
+API_ID           = int(_require("API_ID"))
+API_HASH         = _require("API_HASH")
+PREFIX           = _require("PREFIX")
+CITY             = _require("CITY")
+TZ               = pytz.timezone(_require("TZ"))
+OW_KEY           = os.getenv("OW_KEY", "").strip()
+VT_KEY           = os.getenv("VT_KEY", "").strip()
 PROFILE_INTERVAL = int(_require("PROFILE_INTERVAL"))
-WEATHER_CACHE = int(_require("WEATHER_CACHE"))
+WEATHER_CACHE    = int(_require("WEATHER_CACHE"))
 
-# ── Emoji constants ────────────────────────────────────────────────
-E_SUN = '☀️'  # ☀️
-E_CLOUD_SUN = '⛅'  # ⛅
-E_CLOUD = '☁️'  # ☁️
-E_WARN = '⚠️'  # ⚠️
-E_CROSS = '❌'  # ❌
-E_CHECK = '✅'  # ✅
-E_PING = "\U0001f3d3"        # 🏓
-E_SEARCH = "\U0001f50e"      # 🔎
-E_GLOBE = "\U0001f310"       # 🌐
-E_SHIELD = "\U0001f6e1"      # 🛡
-E_GREEN = "\U0001f7e2"       # 🟢
-E_RED = "\U0001f534"         # 🔴
-E_YELLOW = "\U0001f7e1"      # 🟡
-E_REFRESH = "\U0001f504"     # 🔄
-E_RECYCLE = '♻️'  # ♻️
-E_PIN = "\U0001f4cc"         # 📌
-E_CLIP = "\U0001f4ce"        # 📎
-E_MAILBOX = "\U0001f4ed"     # 📭
-E_TRASH = "\U0001f5d1"       # 🗑
-E_DOWN = '⬇️'  # ⬇️
-E_ELLIPSIS = '…'  # …
-E_DASH = '–'  # –
-
-E_DEGREE = '°'          # degree
-E_BULLET = '•'          # bullet
-
-# ── Client & State ─────────────────────────────────────────────────
+# ── Client & State ───────────────────────────────────────────────────
 
 client = TelegramClient("session", API_ID, API_HASH)
 _http: Optional[aiohttp.ClientSession] = None
-_weather_cache: Tuple[float, Optional[Dict[str, Any]]] = (0.0, None)
-_weather_lock = asyncio.Lock()
-_last_bio = ""
+_weather_cache: tuple[float, Optional[dict[str, Any]]] = (0.0, None)
+_weather_lock   = asyncio.Lock()
+_last_bio       = ""
 _profile_errors = 0
-_shutting_down = False
+_shutting_down  = False
+_start_time     = time.time()
 
-# ── Helpers ─────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────
 
 def pat(cmd: str) -> str:
     return rf"^{re.escape(PREFIX)}{cmd}\b(?:\s+([\s\S]+))?$"
 
 def clamp(s: str, n: int) -> str:
-    return s if len(s) <= n else s[: n - 1] + E_ELLIPSIS
+    return s if len(s) <= n else s[:n - 1] + "…"
 
 def _normalize_name(name: str) -> str:
-    """Normalize note name: NFKC + casefold + squeeze whitespace."""
     return " ".join(unicodedata.normalize("NFKC", name).casefold().split())
 
-
 def _escape_md(s: str) -> str:
-    """Escape markdown special chars for safe display."""
     return s.replace("`", "｀")
 
 async def safe_edit(e, text: str) -> None:
@@ -123,36 +94,35 @@ async def close_http() -> None:
         await _http.close()
         _http = None
 
-def sha256_file(path: str, chunk_size: int = 1024 * 1024) -> str:
-    """Hash file in chunks to avoid loading entire file into RAM."""
+def sha256_file(path: str, chunk_size: int = 1 << 20) -> str:
     h = sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(chunk_size), b""):
             h.update(chunk)
     return h.hexdigest()
 
-async def download_replied_file(e) -> Optional[Tuple[Any, str]]:
+async def download_replied_file(e) -> Optional[tuple[Any, str]]:
     if not e.is_reply:
-        await e.edit(f"{E_WARN} Reply to a file.")
+        await safe_edit(e, "⚠️ Reply to a file.")
         return None
     r = await e.get_reply_message()
     if not r.file:
-        await e.edit(f"{E_WARN} No file in reply.")
+        await safe_edit(e, "⚠️ No file in reply.")
         return None
     path = await r.download_media()
     if not path:
-        await e.edit(f"{E_CROSS} Download failed.")
+        await safe_edit(e, "❌ Download failed.")
         return None
     return r, path
 
-# ── Weather & Bio ───────────────────────────────────────────────────
+# ── Weather & Bio ────────────────────────────────────────────────────
 
 def _cloud_icon(c: int) -> str:
     if c < 20:
-        return E_SUN
-    return E_CLOUD_SUN if c < 60 else E_CLOUD
+        return "☀️"
+    return "⛅" if c < 60 else "☁️"
 
-async def fetch_weather() -> Dict[str, Any]:
+async def fetch_weather() -> dict[str, Any]:
     if not OW_KEY:
         return {}
 
@@ -177,16 +147,16 @@ async def fetch_weather() -> Dict[str, Any]:
 
             if data.get("cod") != 200:
                 logging.warning("Weather API: %s", data.get("message", data.get("cod")))
-                result = {"_fail": True}
+                result: dict[str, Any] = {"_fail": True}
             else:
                 m = data["main"]
                 result = {
                     "icon": _cloud_icon(data.get("clouds", {}).get("all", 0)),
                     "temp": round(float(m["temp"])),
-                    "hum": int(m["humidity"]),
+                    "hum":  int(m["humidity"]),
                     "wind": float(data.get("wind", {}).get("speed", 0)),
-                    "sr": datetime.fromtimestamp(data["sys"]["sunrise"], TZ).strftime("%H:%M"),
-                    "ss": datetime.fromtimestamp(data["sys"]["sunset"], TZ).strftime("%H:%M"),
+                    "sr":   datetime.fromtimestamp(data["sys"]["sunrise"], TZ).strftime("%H:%M"),
+                    "ss":   datetime.fromtimestamp(data["sys"]["sunset"],  TZ).strftime("%H:%M"),
                 }
         except Exception as exc:
             logging.warning("Weather fetch: %s", exc)
@@ -195,11 +165,11 @@ async def fetch_weather() -> Dict[str, Any]:
         _weather_cache = (time.time(), result)
         return {} if result.get("_fail") else result
 
-def build_bio(w: Dict[str, Any]) -> str:
+def build_bio(w: dict[str, Any]) -> str:
     if not w:
         return clamp(CITY, 70)
     return clamp(
-        f"{CITY} {w['temp']}{E_DEGREE}C {w['icon']} {E_BULLET} {w['hum']}% {E_BULLET} {w['wind']:.1f}m/s {E_BULLET} {w['sr']}{E_DASH}{w['ss']}",
+        f"{CITY} {w['temp']}°C {w['icon']} • {w['hum']}% • {w['wind']:.1f}m/s • {w['sr']}–{w['ss']}",
         70,
     )
 
@@ -218,17 +188,14 @@ async def profile_loop() -> None:
             _profile_errors += 1
             logging.warning("profile_loop: %s (err #%d)", exc, _profile_errors)
 
-        if _profile_errors > 0:
-            backoff = min(30 * (2 ** (_profile_errors - 1)), 1800)
-            await asyncio.sleep(backoff)
-        else:
-            await asyncio.sleep(PROFILE_INTERVAL)
+        backoff = min(30 * (2 ** (_profile_errors - 1)), 1800) if _profile_errors else PROFILE_INTERVAL
+        await asyncio.sleep(backoff)
 
-# ── Notes Index (RAM cache + JSON persistence) ─────────────────────
+# ── Notes Index (RAM cache + JSON persistence) ───────────────────────
 
-NOTE_TAG = E_PIN
+NOTE_TAG        = "📌"
 NOTES_INDEX_FILE = "notes_index.json"
-_notes_index: Dict[str, Dict[str, Any]] = {}  # {norm: {"id": int, "name": str}}
+_notes_index: dict[str, dict[str, Any]] = {}
 
 def _load_notes_index() -> None:
     global _notes_index
@@ -238,10 +205,8 @@ def _load_notes_index() -> None:
             return
         with open(NOTES_INDEX_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-
-        # migrate old format: {norm: id}
         if isinstance(data, dict) and data and all(isinstance(v, int) for v in data.values()):
-            _notes_index = {}  # will rebuild on first use
+            _notes_index = {}
             _save_notes_index()
         elif isinstance(data, dict):
             _notes_index = data
@@ -260,44 +225,44 @@ def _save_notes_index() -> None:
 async def _rebuild_notes_index() -> None:
     global _notes_index
     _notes_index.clear()
-    max_notes = 500
-    found = 0
     async for msg in client.iter_messages("me", limit=3000):
         raw = msg.raw_text or ""
         if raw.startswith(NOTE_TAG) and msg.reply_to:
             shown = raw[len(NOTE_TAG):].strip()
-            norm = _normalize_name(shown)
+            norm  = _normalize_name(shown)
             if norm and norm not in _notes_index:
                 _notes_index[norm] = {"id": msg.reply_to.reply_to_msg_id, "name": shown}
-                found += 1
-                if found >= max_notes:
+                if len(_notes_index) >= 500:
                     break
     _save_notes_index()
     logging.info("Notes index rebuilt: %d notes", len(_notes_index))
 
-# ── Help ────────────────────────────────────────────────────────────
+# ── Help ─────────────────────────────────────────────────────────────
 
 HELP = "\n".join([
     f"**Selfbot** (`{PREFIX}`)",
     "",
-    f"`{PREFIX}help` \u2014 commands list",
-    f"`{PREFIX}ping` \u2014 latency",
-    f"`{PREFIX}id` \u2014 chat / user ID",
-    f"`{PREFIX}del` \u2014 delete replied msg",
-    f"`{PREFIX}purge <n>` \u2014 bulk delete",
-    f"`{PREFIX}virus` \u2014 VirusTotal lookup",
-    f"`{PREFIX}rebio` \u2014 force bio update",
-    f"`{PREFIX}reload` \u2014 restart bot",
+    f"`{PREFIX}help`    — commands list",
+    f"`{PREFIX}ping`    — latency",
+    f"`{PREFIX}id`      — chat / user ID",
+    f"`{PREFIX}info`    — user info (reply or self)",
+    f"`{PREFIX}uptime`  — bot uptime",
+    f"`{PREFIX}del`     — delete replied msg",
+    f"`{PREFIX}purge <n>` — bulk delete",
+    f"`{PREFIX}copy`    — copy replied msg content",
+    f"`{PREFIX}virus`   — VirusTotal lookup",
+    f"`{PREFIX}rebio`   — force bio update",
+    f"`{PREFIX}reload`  — restart bot",
     "",
     "**Save / Send:**",
-    f"`{PREFIX}save <name>` \u2014 save replied msg with a note name",
-    f"`{PREFIX}saved` \u2014 list all saved notes",
-    f"`{PREFIX}get <name>` \u2014 forward saved note to current chat",
-    f"`{PREFIX}delnote <name>` \u2014 delete a saved note",
-    f"`{PREFIX}rename <old> | <new>`  rename a saved note",
+    f"`{PREFIX}save <name>`         — save replied msg",
+    f"`{PREFIX}saved`               — list saved notes",
+    f"`{PREFIX}get <name>`          — forward saved note",
+    f"`{PREFIX}delnote <name>`      — delete a saved note",
+    f"`{PREFIX}rename <old> | <new>` — rename a saved note",
 ])
 
-# ── Commands ────────────────────────────────────────────────────────
+# ── Commands ─────────────────────────────────────────────────────────
 
 @client.on(events.NewMessage(pattern=pat("help"), outgoing=True))
 async def cmd_help(e):
@@ -306,8 +271,8 @@ async def cmd_help(e):
 @client.on(events.NewMessage(pattern=pat("ping"), outgoing=True))
 async def cmd_ping(e):
     t0 = time.perf_counter()
-    await e.edit(E_ELLIPSIS)
-    await e.edit(f"{E_PING} {int((time.perf_counter() - t0) * 1000)} ms")
+    await e.edit("…")
+    await e.edit(f"🏓 {int((time.perf_counter() - t0) * 1000)} ms")
 
 @client.on(events.NewMessage(pattern=pat("id"), outgoing=True))
 async def cmd_id(e):
@@ -316,6 +281,42 @@ async def cmd_id(e):
         await e.edit(f"chat: `{e.chat_id}`\nuser: `{r.sender_id}`")
     else:
         await e.edit(f"chat: `{e.chat_id}`")
+
+@client.on(events.NewMessage(pattern=pat("info"), outgoing=True))
+async def cmd_info(e):
+    target = await e.get_reply_message() if e.is_reply else None
+    user   = await client.get_entity(target.sender_id if target else "me")
+    name   = " ".join(filter(None, [user.first_name, user.last_name]))
+    lines  = [f"👤 **{name}**"]
+    if user.username:
+        lines.append(f"🔗 @{user.username}")
+    lines.append(f"🆔 `{user.id}`")
+    if getattr(user, "phone", None):
+        lines.append(f"📞 `{user.phone}`")
+    if getattr(user, "about", None):
+        lines.append(f"📝 {user.about}")
+    await e.edit("\n".join(lines))
+
+@client.on(events.NewMessage(pattern=pat("uptime"), outgoing=True))
+async def cmd_uptime(e):
+    delta = int(time.time() - _start_time)
+    h, rem = divmod(delta, 3600)
+    m, s   = divmod(rem, 60)
+    await e.edit(f"⏱ Uptime: `{h:02d}:{m:02d}:{s:02d}`")
+
+@client.on(events.NewMessage(pattern=pat("copy"), outgoing=True))
+async def cmd_copy(e):
+    if not e.is_reply:
+        return await safe_edit(e, "⚠️ Reply to a message to copy.")
+    r = await e.get_reply_message()
+    try:
+        await e.delete()
+    except Exception:
+        pass
+    if r.media:
+        await client.send_file(e.chat_id, r.media, caption=r.raw_text or "")
+    else:
+        await client.send_message(e.chat_id, r.raw_text or "", formatting_entities=r.entities)
 
 @client.on(events.NewMessage(pattern=pat("del"), outgoing=True))
 async def cmd_del(e):
@@ -326,7 +327,7 @@ async def cmd_del(e):
         await r.delete()
         await e.delete()
     except Exception:
-        await e.edit(f"{E_CROSS} Can't delete.")
+        await e.edit("❌ Can't delete.")
 
 @client.on(events.NewMessage(pattern=pat("purge"), outgoing=True))
 async def cmd_purge(e):
@@ -334,11 +335,10 @@ async def cmd_purge(e):
     try:
         n = max(1, min(200, int(arg) if arg else 10))
     except ValueError:
-        return await e.edit(f"{E_WARN} {PREFIX}purge <number>")
+        return await e.edit(f"⚠️ {PREFIX}purge <number>")
 
-    scan_limit = min(2000, n * 8)
     ids = []
-    async for msg in client.iter_messages(e.chat_id, limit=scan_limit):
+    async for msg in client.iter_messages(e.chat_id, limit=min(2000, n * 8)):
         if msg.out and msg.id != e.id:
             ids.append(msg.id)
             if len(ids) >= n:
@@ -348,20 +348,20 @@ async def cmd_purge(e):
         try:
             await client.delete_messages(e.chat_id, ids, revoke=True)
         except Exception:
-            return await e.edit(f"{E_CROSS} Purge failed.")
+            return await e.edit("❌ Purge failed.")
     await e.delete()
 
 @client.on(events.NewMessage(pattern=pat("virus"), outgoing=True))
 async def cmd_virus(e):
     if not VT_KEY:
-        return await e.edit(f"{E_WARN} VT_KEY not set.")
+        return await e.edit("⚠️ VT_KEY not set.")
     result = await download_replied_file(e)
     if not result:
         return
     _, path = result
 
     try:
-        await e.edit(f"{E_SEARCH} Scanning{E_ELLIPSIS}")
+        await e.edit("🔎 Scanning…")
         h = sha256_file(path)
     finally:
         try:
@@ -369,7 +369,7 @@ async def cmd_virus(e):
         except OSError:
             pass
 
-    await e.edit(f"{E_GLOBE} VT lookup{E_ELLIPSIS}")
+    await e.edit("🌐 VT lookup…")
     try:
         s = await get_http()
         async with s.get(
@@ -377,53 +377,53 @@ async def cmd_virus(e):
             headers={"x-apikey": VT_KEY},
         ) as resp:
             if resp.status not in (200, 404):
-                return await e.edit(f"{E_CROSS} VT HTTP {resp.status}")
+                return await e.edit(f"❌ VT HTTP {resp.status}")
             data = await resp.json(content_type=None)
     except Exception:
-        return await e.edit(f"{E_CROSS} VT request failed.")
+        return await e.edit("❌ VT request failed.")
 
     if "data" not in data:
-        return await e.edit(f"{E_YELLOW} Not found on VT\n`{h}`")
+        return await e.edit(f"🟡 Not found on VT\n`{h}`")
 
-    st = data["data"]["attributes"]["last_analysis_stats"]
-    mal, sus, und = st.get("malicious", 0), st.get("suspicious", 0), st.get("undetected", 0)
-    icon = f"{E_GREEN} Clean" if (mal == 0 and sus == 0) else f"{E_RED} Detected"
-    await e.edit(f"{E_SHIELD} {icon}  mal:`{mal}` sus:`{sus}` und:`{und}`\n`{h}`")
+    st  = data["data"]["attributes"]["last_analysis_stats"]
+    mal = st.get("malicious", 0)
+    sus = st.get("suspicious", 0)
+    und = st.get("undetected", 0)
+    icon = "🟢 Clean" if (mal == 0 and sus == 0) else "🔴 Detected"
+    await e.edit(f"🛡 {icon}  mal:`{mal}` sus:`{sus}` und:`{und}`\n`{h}`")
 
 @client.on(events.NewMessage(pattern=pat("rebio"), outgoing=True))
 async def cmd_rebio(e):
     global _last_bio, _profile_errors
-    await e.edit(f"{E_REFRESH} Updating{E_ELLIPSIS}")
+    await e.edit("🔄 Updating…")
     try:
         b = build_bio(await fetch_weather())
         await client(UpdateProfileRequest(about=b))
         _last_bio = b
         _profile_errors = 0
-        await e.edit(f"{E_CHECK} {b}")
+        await e.edit(f"✅ {b}")
     except Exception as exc:
-        await e.edit(f"{E_CROSS} {exc}")
+        await e.edit(f"❌ {exc}")
 
 @client.on(events.NewMessage(pattern=pat("reload"), outgoing=True))
 async def cmd_reload(e):
-    await e.edit(f"{E_RECYCLE} Restarting{E_ELLIPSIS}")
+    await e.edit("♻️ Restarting…")
     await close_http()
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
-# ── Save & Send Commands ───────────────────────────────────────────
+# ── Save & Send Commands ─────────────────────────────────────────────
 
 @client.on(events.NewMessage(pattern=pat("save"), outgoing=True))
 async def cmd_save(e):
-    """Save replied message to Saved Messages with a note name (forward-based)."""
     arg = (e.pattern_match.group(1) or "").strip()
     if not arg:
-        return await safe_edit(e, f"{E_WARN} Usage: `{PREFIX}save <name>` (reply to a message)")
-
+        return await safe_edit(e, f"⚠️ Usage: `{PREFIX}save <name>` (reply to a message)")
     if not e.is_reply:
-        return await safe_edit(e, f"{E_WARN} Reply to a message to save it.")
+        return await safe_edit(e, "⚠️ Reply to a message to save it.")
 
     r = await e.get_reply_message()
     if not r:
-        return await safe_edit(e, f"{E_CROSS} Cannot get replied message.")
+        return await safe_edit(e, "❌ Cannot get replied message.")
 
     name = " ".join(arg.split())
     norm = _normalize_name(name)
@@ -432,28 +432,23 @@ async def cmd_save(e):
     if not _notes_index:
         await _rebuild_notes_index()
 
-    # If note with same name exists -> refuse (no overwrite)
     if norm in _notes_index:
-        old_name = " ".join(((_notes_index[norm].get("name") or name) or "").splitlines())
-        show = _escape_md(old_name)
+        show = _escape_md((_notes_index[norm].get("name") or name).replace("\n", " "))
         return await safe_edit(
             e,
-            f"{E_WARN} Note `{show}` already exists.\n"
-            f"Delete it first: `{PREFIX}delnote {show}`\n"
-            f"Then save again."
+            f"⚠️ Note `{show}` already exists.\n"
+            f"Delete first: `{PREFIX}delnote {show}`",
         )
 
     try:
-        # Forward content to Saved Messages (fast, no download/upload)
         content_msg = None
         try:
             content_msg = await r.forward_to("me")
         except Exception:
-            # Fallback: re-send for restricted chats
             if r.media:
                 path = await r.download_media()
                 if path:
-                    raw = r.raw_text or ""
+                    raw  = r.raw_text or ""
                     ents = list(r.entities or [])
                     try:
                         content_msg = await client.send_file(
@@ -465,85 +460,84 @@ async def cmd_save(e):
                         except OSError:
                             pass
                 else:
-                    content_msg = await client.send_message(
-                        "me", r.raw_text or "[media failed]")
+                    content_msg = await client.send_message("me", r.raw_text or "[media failed]")
             else:
-                raw = r.raw_text or ""
+                raw  = r.raw_text or ""
                 ents = list(r.entities or [])
                 content_msg = await client.send_message(
                     "me", raw or "[empty]",
                     formatting_entities=ents or None)
 
-        # Reply to content with the tag (for indexing)
         if content_msg:
             await client.send_message("me", tag_line, reply_to=content_msg.id)
             _notes_index[norm] = {"id": content_msg.id, "name": name}
             _save_notes_index()
 
-        await safe_edit(e, f"{E_CHECK} Saved as `{_escape_md(name)}`")
+        await safe_edit(e, f"✅ Saved as `{_escape_md(name)}`")
+        await asyncio.sleep(1)
+        try:
+            await e.delete()
+        except Exception:
+            pass
     except Exception as exc:
-        await safe_edit(e, f"{E_CROSS} Save failed: {exc}")
+        await safe_edit(e, f"❌ Save failed: {exc}")
+        await asyncio.sleep(1)
+        try:
+            await e.delete()
+        except Exception:
+            pass
 
 @client.on(events.NewMessage(pattern=pat("saved"), outgoing=True))
 async def cmd_saved(e):
-    """List all saved notes (from cached index)."""
     try:
         if not _notes_index:
-            await safe_edit(e, f"{E_REFRESH} Rebuilding index{E_ELLIPSIS}")
+            await safe_edit(e, "🔄 Rebuilding index…")
             await _rebuild_notes_index()
-
         if not _notes_index:
-            return await safe_edit(e, f"{E_MAILBOX} No saved notes. Use `{PREFIX}save <name>` to save.")
+            return await safe_edit(e, f"📭 No saved notes. Use `{PREFIX}save <name>` to save.")
 
-        items = sorted(_notes_index.values(), key=lambda x: _normalize_name(x.get("name", "")))
+        items    = sorted(_notes_index.values(), key=lambda x: _normalize_name(x.get("name", "")))
         max_show = 80
-        shown = items[:max_show]
-
-        lines = ["**Saved Notes:**\n"]
-        for it in shown:
-            nm = _escape_md(it.get("name", "") or "")
-            lines.append(f"{E_BULLET} `{nm}`")
-
+        lines    = ["**Saved Notes:**\n"]
+        for it in items[:max_show]:
+            lines.append(f"• `{_escape_md(it.get('name', '') or '')}`")
         if len(items) > max_show:
-            lines.append(f"\n{E_DOWN} Showing {max_show}/{len(items)} (too many to display)")
-
+            lines.append(f"\n⬇️ Showing {max_show}/{len(items)}")
         lines.append(f"\nTotal: {len(items)}")
         lines.append(f"Use `{PREFIX}get <name>` to send")
         await safe_edit(e, "\n".join(lines))
     except Exception as exc:
-        await safe_edit(e, f"{E_CROSS} Error: {exc}")
+        await safe_edit(e, f"❌ Error: {exc}")
 
 @client.on(events.NewMessage(pattern=pat("get"), outgoing=True))
 async def cmd_get(e):
-    """Forward saved note to current chat (fast, server-side forward)."""
     if not _notes_index:
         await _rebuild_notes_index()
 
     arg = (e.pattern_match.group(1) or "").strip()
     if not arg:
-        return await safe_edit(e, f"{E_WARN} Usage: `{PREFIX}get <name>`")
+        return await safe_edit(e, f"⚠️ Usage: `{PREFIX}get <name>`")
 
-    norm = _normalize_name(arg)
+    norm    = _normalize_name(arg)
     chat_id = e.chat_id
 
     try:
-        entry = _notes_index.get(norm)
+        entry  = _notes_index.get(norm)
         msg_id = entry["id"] if entry else None
 
-        # Cache miss -> try rebuild once
         if msg_id is None:
             await _rebuild_notes_index()
-            entry = _notes_index.get(norm)
+            entry  = _notes_index.get(norm)
             msg_id = entry["id"] if entry else None
 
         if msg_id is None:
-            return await safe_edit(e, f"{E_CROSS} Note `{_escape_md(arg)}` not found.")
+            return await safe_edit(e, f"❌ Note `{_escape_md(arg)}` not found.")
 
         content_msg = await client.get_messages("me", ids=msg_id)
         if not content_msg:
             _notes_index.pop(norm, None)
             _save_notes_index()
-            return await safe_edit(e, f"{E_CROSS} Content message was deleted.")
+            return await safe_edit(e, "❌ Content message was deleted.")
 
         try:
             await e.delete()
@@ -552,42 +546,36 @@ async def cmd_get(e):
         await content_msg.forward_to(chat_id)
     except Exception as exc:
         try:
-            await safe_edit(e, f"{E_CROSS} Send failed: {exc}")
+            await safe_edit(e, f"❌ Send failed: {exc}")
         except Exception:
             logging.warning("cmd_get error: %s", exc)
 
 @client.on(events.NewMessage(pattern=pat("rename"), outgoing=True))
 async def cmd_rename(e):
-    """Rename a saved note: /rename old | new"""
     if not _notes_index:
         await _rebuild_notes_index()
 
     arg = (e.pattern_match.group(1) or "").strip()
     if "|" not in arg:
-        return await safe_edit(e, f"{E_WARN} Usage: `{PREFIX}rename old name | new name`")
+        return await safe_edit(e, f"⚠️ Usage: `{PREFIX}rename old name | new name`")
 
-    parts = arg.split("|", 1)
-    old_name = parts[0].strip()
-    new_name = parts[1].strip()
+    old_name, new_name = (p.strip() for p in arg.split("|", 1))
     if not old_name or not new_name:
-        return await safe_edit(e, f"{E_WARN} Both old and new names required.")
+        return await safe_edit(e, "⚠️ Both old and new names required.")
 
     old_norm = _normalize_name(old_name)
     new_norm = _normalize_name(new_name)
+    entry    = _notes_index.get(old_norm)
 
-    entry = _notes_index.get(old_norm)
     if not entry:
-        return await safe_edit(e, f"{E_CROSS} Note `{old_name}` not found.")
-
+        return await safe_edit(e, f"❌ Note `{old_name}` not found.")
     if new_norm in _notes_index:
-        return await safe_edit(e, f"{E_WARN} Note `{new_name}` already exists.")
+        return await safe_edit(e, f"⚠️ Note `{new_name}` already exists.")
 
-    # Update index
     _notes_index.pop(old_norm, None)
     _notes_index[new_norm] = {"id": entry["id"], "name": new_name}
     _save_notes_index()
 
-    # Update tag message in Saved Messages
     try:
         async for msg in client.iter_messages("me", limit=2000):
             raw = msg.raw_text or ""
@@ -597,28 +585,26 @@ async def cmd_rename(e):
     except Exception:
         pass
 
-    await safe_edit(e, f"{E_CHECK} Renamed `{_escape_md(old_name)}` -> `{_escape_md(new_name)}`")
+    await safe_edit(e, f"✅ Renamed `{_escape_md(old_name)}` → `{_escape_md(new_name)}`")
 
 @client.on(events.NewMessage(pattern=pat("delnote"), outgoing=True))
 async def cmd_delnote(e):
-    """Delete a saved note by name."""
     if not _notes_index:
         await _rebuild_notes_index()
 
     arg = (e.pattern_match.group(1) or "").strip()
     if not arg:
-        return await safe_edit(e, f"{E_WARN} Usage: `{PREFIX}delnote <name>`")
+        return await safe_edit(e, f"⚠️ Usage: `{PREFIX}delnote <name>`")
 
-    norm = _normalize_name(arg)
-    entry = _notes_index.pop(norm, None)
+    norm   = _normalize_name(arg)
+    entry  = _notes_index.pop(norm, None)
     msg_id = entry["id"] if entry else None
 
     if msg_id is None:
-        return await safe_edit(e, f"{E_CROSS} Note `{_escape_md(arg)}` not found.")
+        return await safe_edit(e, f"❌ Note `{_escape_md(arg)}` not found.")
 
     _save_notes_index()
 
-    # Try to delete the content + tag messages from Saved Messages
     try:
         async for msg in client.iter_messages("me", limit=2000):
             raw = msg.raw_text or ""
@@ -629,16 +615,16 @@ async def cmd_delnote(e):
     except Exception:
         pass
 
-    await safe_edit(e, f"{E_TRASH} Deleted note `{_escape_md(arg)}`.")
+    await safe_edit(e, f"🗑 Deleted note `{_escape_md(arg)}`.")
 
-# ── Entry ───────────────────────────────────────────────────────────
+# ── Entry ─────────────────────────────────────────────────────────────
 
 async def _shutdown() -> None:
     global _shutting_down
     if _shutting_down:
         return
     _shutting_down = True
-    logging.info("Shutting down...")
+    logging.info("Shutting down…")
     await close_http()
     await client.disconnect()
 
@@ -652,7 +638,7 @@ async def main() -> None:
 
     _load_notes_index()
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     for sig_name in ("SIGINT", "SIGTERM"):
         sig = getattr(signal, sig_name, None)
         if sig:
