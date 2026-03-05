@@ -45,6 +45,7 @@ CITY = _require("CITY")
 TZ = pytz.timezone(_require("TZ"))
 OW_KEY = os.getenv("OW_KEY", "").strip()
 VT_KEY = os.getenv("VT_KEY", "").strip()
+GH_TOKEN = os.getenv("GH_TOKEN", "").strip()
 PROFILE_INTERVAL = int(_require("PROFILE_INTERVAL"))
 WEATHER_CACHE = int(_require("WEATHER_CACHE"))
 
@@ -57,6 +58,7 @@ client = TelegramClient("session", API_ID, API_HASH)
 _http: Optional[aiohttp.ClientSession] = None
 _weather_cache: tuple[float, Optional[dict[str, Any]]] = (0.0, None)
 _weather_lock = asyncio.Lock()
+_cancel_build_events: dict[int, asyncio.Event] = {}
 
 _last_bio = ""
 _profile_errors = 0
@@ -122,6 +124,27 @@ def sha256_file(path: str, chunk: int = 1 << 20) -> str:
             h.update(block)
     return h.hexdigest()
 
+async def _fetch_json(url: str, method: str = "GET", **kwargs) -> Optional[dict]:
+    s = await get_http()
+    try:
+        async with s.request(method, url, **kwargs) as r:
+            if r.status not in (200, 202, 404):
+                return None
+            return await r.json(content_type=None)
+    except Exception as exc:
+        logging.warning("_fetch_json err: %s", exc)
+        return None
+
+async def _fetch_text(url: str, **kwargs) -> Optional[str]:
+    s = await get_http()
+    try:
+        async with s.get(url, **kwargs) as r:
+            if r.status == 200:
+                return await r.text()
+    except Exception as exc:
+        logging.warning("_fetch_text err: %s", exc)
+    return None
+
 # ─────────────────────────────────────────────────────────────
 # Weather / Bio
 # ─────────────────────────────────────────────────────────────
@@ -138,19 +161,9 @@ async def fetch_weather() -> dict[str, Any]:
             return {} if cached.get("_fail") else cached
 
         try:
-            s = await get_http()
-            async with s.get(
-                "https://api.openweathermap.org/data/2.5/weather",
-                params={"q": CITY, "appid": OW_KEY, "units": "metric", "lang": "vi"},
-            ) as r:
-                if r.status != 200:
-                    logging.warning("Weather API HTTP %s", r.status)
-                    _weather_cache = (time.time(), {"_fail": True})
-                    return {}
-                data = await r.json(content_type=None)
-
-            if data.get("cod") != 200:
-                logging.warning("Weather API: %s", data.get("message", data.get("cod")))
+            data = await _fetch_json("https://api.openweathermap.org/data/2.5/weather", params={"q": CITY, "appid": OW_KEY, "units": "metric", "lang": "vi"})
+            if not data or data.get("cod") != 200:
+                logging.warning("Weather API: %s", data.get("message", data.get("cod")) if data else "Failed")
                 result: dict[str, Any] = {"_fail": True}
             else:
                 c = data.get("clouds", {}).get("all", 0)
@@ -255,6 +268,7 @@ HELP = "\n".join(
         f"`{PREFIX}virus`   — VirusTotal lookup",
         f"`{PREFIX}rebio`   — force bio update",
         f"`{PREFIX}reload`  — restart bot",
+        f"`{PREFIX}miui <model>` — MIUI firmware versions",
         "",
         "**Save / Send:**",
         f"`{PREFIX}save <name>`          — save replied msg",
@@ -340,17 +354,9 @@ async def cmd_virus(e):
             pass
 
     await e.edit("VT lookup…")
-    try:
-        s = await get_http()
-        async with s.get(
-            f"https://www.virustotal.com/api/v3/files/{h}",
-            headers={"x-apikey": VT_KEY},
-        ) as resp:
-            if resp.status not in (200, 404):
-                return await _reply(e, f"VT HTTP {resp.status}")
-            data = await resp.json(content_type=None)
-    except Exception:
-        return await _reply(e, "VT request failed.")
+    data = await _fetch_json(f"https://www.virustotal.com/api/v3/files/{h}", headers={"x-apikey": VT_KEY})
+    if not data:
+        return await _reply(e, "VT request failed or HTTP error.")
 
     if "data" not in data:
         return await _reply(e, f"Not found on VT\n`{h}`")
@@ -556,6 +562,727 @@ async def cmd_delnote(e):
 
     await _reply(e, f"Deleted: `{_esc(arg)}`")
 
+_LATEST_YML = "https://raw.githubusercontent.com/XiaomiFirmwareUpdater/miui-updates-tracker/master/data/latest.yml"
+
+@client.on(events.NewMessage(pattern=pat("miui"), outgoing=True))
+async def cmd_miui(e):
+    arg = (e.pattern_match.group(1) or "").strip().lower()
+    parts = arg.split()
+    model = parts[0] if parts else ""
+    region_filter = parts[1] if len(parts) > 1 else "cn"  # default CN
+
+    _REGION_MAP = {
+        "cn": "china", "global": "global", "eea": "eea",
+        "in": "india",  "ru": "russia",  "tr": "turkey",
+        "tw": "taiwan", "id": "indonesia",
+    }
+    _VALID_REGIONS = tuple(_REGION_MAP)
+    if not model:
+        return await _reply(e, f"Usage: `{PREFIX}miui <model> [{'|'.join(_VALID_REGIONS)}]`")
+    if region_filter not in _VALID_REGIONS:
+        return await _reply(e, f"Usage: `{PREFIX}miui <model> [{'|'.join(_VALID_REGIONS)}]`")
+
+    await e.edit(f"🔍 Fetching firmware for `{model}`{' (' + region_filter + ')' if region_filter else ''}…")
+
+    try:
+        yml_text = await _fetch_text(_LATEST_YML, timeout=aiohttp.ClientTimeout(total=20))
+        if not yml_text:
+            return await safe_edit(e, "Failed to fetch firmware list.")
+    except Exception as exc:
+        return await safe_edit(e, f"Request failed: {exc}")
+
+    # Quick check: does codename exist in the file at all?
+    if f"codename: {model}" not in yml_text:
+        return await safe_edit(e, f"Model `{model}` not found.")
+
+    def _os_gen(ver: str) -> str:
+        v = ver.upper()
+        if v.startswith("OS3"): return "OS3"
+        if v.startswith("OS2"): return "OS2"
+        if v.startswith("OS1"): return "OS1"
+        return "MIUI"
+
+    def _yml_field(block: str, key: str) -> str:
+        m = re.search(rf"(?:^|\n)\s*{key}:\s*['\"]?([^'\"\n]+)['\"]?", block)
+        return m.group(1).strip() if m else ""
+
+    # Parse YAML: split on list-item boundaries
+    raw_blocks = re.split(r"\n(?=- android:)", yml_text)
+    device_name = model
+
+    # Two-pass: prefer Stable, fall back to any branch (Dev/Beta) if gen missing
+    best_stable: dict[str, dict] = {}
+    best_any:    dict[str, dict] = {}
+
+    def _update_best(store: dict[str, dict], gen: str, candidate: dict) -> None:
+        existing = store.get(gen)
+        if existing is None:
+            store[gen] = candidate
+        else:
+            try:
+                if float(candidate.get("android") or 0) >= float(existing.get("android") or 0):
+                    store[gen] = candidate
+            except ValueError:
+                pass
+
+    for blk in raw_blocks:
+        if f"codename: {model}" not in blk:
+            continue
+        if _yml_field(blk, "method").lower() != "recovery":
+            continue
+        ver_str = _yml_field(blk, "version")
+        if not ver_str:
+            continue
+        android = _yml_field(blk, "android")
+        link    = _yml_field(blk, "link")
+        name    = _yml_field(blk, "name")
+        size    = _yml_field(blk, "size")
+        date    = _yml_field(blk, "date")
+        branch  = _yml_field(blk, "branch")
+
+        # Device display name
+        if device_name == model and name:
+            device_name = re.sub(r"\s+(China|Global|India|Russia|Taiwan|Turkey|Indonesia|EEA|Japan|DC|EU)$", "", name, flags=re.IGNORECASE).strip()
+
+        # Region filter: match name field against keyword
+        name_lower = name.lower()
+        region_kw = _REGION_MAP[region_filter]  # e.g. 'eea', 'india', 'china'
+        if region_kw not in name_lower:
+            continue
+
+        gen = _os_gen(ver_str)
+        candidate = {
+            "os": ver_str, "android": android, "release": date,
+            "link": link, "size": size, "gen": gen, "branch": branch,
+        }
+        _update_best(best_any, gen, candidate)
+        if branch.lower() == "stable":
+            _update_best(best_stable, gen, candidate)
+
+    # ── Source 2: hyperos.fans (HyperOS OS1/OS2/OS3 full history) ────────────
+    _HYPEROS_API = "https://data.hyperos.fans/devices/{}.json"
+    # Strip region suffix from model to get base codename (e.g. "nuwa_global" → "nuwa")
+    base_model = model.split("_")[0]
+    try:
+        hdata = await _fetch_json(_HYPEROS_API.format(base_model), timeout=aiohttp.ClientTimeout(total=10))
+        if hdata:
+            branches = hdata.get("branches") or []
+            for br in branches:
+                br_region = br.get("region", "")
+                tagmap = {"cn": "cn", "global": "global", "eea": "eea",
+                          "in": "in", "ru": "ru", "tr": "tr", "tw": "tw", "id": "id"}
+                if br_region != tagmap.get(region_filter, region_filter):
+                    continue
+                is_stable = br.get("branchtag") == "F"
+                br_name   = (br.get("name") or {}).get("en", "")
+                roms = br.get("roms") or {}
+                for ver_str, info in roms.items():
+                    gen = _os_gen(ver_str)
+                    if gen == "MIUI":
+                        continue  # MIUI handled by latest.yml
+                    android  = info.get("android") or ""
+                    rec_file = info.get("recovery") or ""
+                    rel_date = info.get("release") or ""
+                    # Build download link
+                    link = f"https://bigota.d.miui.com/{ver_str}/{rec_file}" if rec_file else ""
+                    if not link and info.get("fastboot"):
+                        fb = info["fastboot"]
+                        link = f"https://bigota.d.miui.com/{ver_str}/{fb}"
+                    br_label = "Stable" if is_stable else "Beta"
+                    candidate = {
+                        "os": ver_str, "android": android, "release": rel_date,
+                        "link": link, "size": "", "gen": gen, "branch": br_label,
+                    }
+                    _update_best(best_any, gen, candidate)
+                    if is_stable:
+                        _update_best(best_stable, gen, candidate)
+    except Exception:
+        pass  # hyperos.fans failure is non-fatal
+
+    # Merge: stable wins; fallback to any if gen has no stable
+    gen_best = {**best_any, **best_stable}
+
+    def _av_key(d: dict) -> float:
+        try:
+            return float(d.get("android") or 0)
+        except ValueError:
+            return 0.0
+
+    sorted_entries = sorted(gen_best.values(), key=_av_key)
+
+    if not sorted_entries:
+        return await safe_edit(e, f"No stable firmware found for `{model}`{' (' + region_filter + ')' if region_filter else ''}.")
+
+    region_label = f" ({region_filter.upper()})" if region_filter else ""
+    header = f"**Latest firmware for {device_name} ({model}){region_label}:**"
+    rows = [header]
+    for d in sorted_entries:
+        ver     = d.get("os", "")
+        android = d.get("android", "")
+        release = d.get("release", "")
+        link    = d.get("link", "")
+        size    = d.get("size", "")
+
+        branch_label = d.get("branch", "Stable")
+        ver_text = f"**[{ver}]({link})**" if link else f"**{ver}**"
+        row = f"› {ver_text} ({branch_label})"
+        sub = []
+        if android:
+            sub.append(f"Android: {android}")
+        if release:
+            sub.append(release)
+        if size:
+            sub.append(size)
+        if sub:
+            row += f"\n  └ {' | '.join(sub)}"
+        rows.append(row)
+
+    await safe_edit(e, "\n\n".join(rows))
+
+
+# ─────────────────────────────────────────────────────────────
+# GKI Kernel Builder
+# ─────────────────────────────────────────────────────────────
+
+_GH_BUILD = {
+    "token": GH_TOKEN,
+    "owner": "HieuKVN",
+    "repo":  "GKI_KernelSU_SUSFS",
+    "ref":   "dev",
+    "workflows": {
+        "a12": "kernel-a12-5-10.yml",
+        "a13": "kernel-a13-5-15.yml",
+        "a14": "kernel-a14-6-1.yml",
+        "a15": "kernel-a15-6-6.yml",
+        "custom": "kernel-custom.yml",
+    },
+}
+
+_build_sessions: dict[int, dict] = {}
+_own_msgs:        set[int]        = set()  # IDs of messages sent by the bot itself
+_KER  = ["a12", "a13", "a14", "a15", "custom"]
+_VAR  = ["Official", "Next", "MKSU", "SukiSU", "ReSukiSU"]
+_BRA  = ["Stable(标准)", "Dev(开发)", "Other(其他/指定)"]
+_AV   = ["android12", "android13", "android14", "android15"]
+_KV   = ["5.10", "5.15", "6.1", "6.6"]
+
+def _gh_headers() -> dict[str, str]:
+    return {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {_GH_BUILD['token']}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+def _ic(v: bool) -> str:
+    return "✅" if v else "❌"
+
+def _tog_text(s: dict) -> str:
+    t = s["toggles"]
+    is_c = s.get("kernel") == "custom"
+    lines = [
+        "⚙️ **Tùy chỉnh tính năng** (gõ số để toggle, `0` để BUILD):\n",
+        f"1. ZRAM:         {_ic(t['use_zram'])}",
+        f"2. BBG:          {_ic(t['use_bbg'])}",
+        f"3. KPM:          {_ic(t['use_kpm'])}",
+        f"4. Hủy SUSFS:   {_ic(t['cancel_susfs'])}",
+    ]
+    if is_c:
+        lines.append(f"5. OnePlus 8E:  {_ic(t['supp_op'])}")
+    lines.append("\n`0` → 🚀 GỬI BUILD")
+    return "\n".join(lines)
+
+async def _build_send(chat_id: int, text: str) -> None:
+    s = _build_sessions.get(chat_id, {})
+    mid = s.get("_mid")
+    if mid:
+        try:
+            msg = await client.edit_message(chat_id, mid, text)
+            s["_mid"] = msg.id
+            _own_msgs.add(msg.id)
+            return
+        except Exception:
+            pass
+    msg = await client.send_message(chat_id, text)
+    s["_mid"] = msg.id
+    _own_msgs.add(msg.id)
+
+@client.on(events.NewMessage(pattern=pat("build"), outgoing=True))
+async def cmd_build(e):
+    chat_id = e.chat_id
+    if chat_id in _build_sessions:
+        await e.edit("⚠️ Đang có build session. Gõ `.stop` để hủy trước.")
+        return
+
+    msg = await client.send_message(chat_id,
+        "🛠 **Bước 1: Chọn loại Build** (gõ số, `q` = thoát)\n\n"
+        "1. A12 (5.10)\n2. A13 (5.15)\n3. A14 (6.1)\n4. A15 (6.6)\n5. Custom")
+    _own_msgs.add(msg.id)
+    _build_sessions[chat_id] = {
+        "step": "kernel",
+        "toggles": {"use_zram": True, "use_bbg": True, "use_kpm": True,
+                    "cancel_susfs": False, "supp_op": False},
+        "custom": {}, "_mid": msg.id,
+    }
+
+@client.on(events.NewMessage(outgoing=True,
+    func=lambda e: e.chat_id in _build_sessions
+        and _build_sessions[e.chat_id].get("step")
+        and e.id not in _own_msgs))
+async def _build_input(e):
+    _own_msgs.discard(e.id)
+    chat_id = e.chat_id
+    s = _build_sessions[chat_id]
+    step = s["step"]
+    raw = (e.raw_text or "").strip()
+
+    # q = thoát bất kỳ lúc nào
+    if raw.lower() == "q":
+        _build_sessions.pop(chat_id, None)
+        await client.send_message(chat_id, "🛑 Đã hủy build.")
+        return
+    # ── Kernel ────────────────────────────────────────────────
+    if step == "kernel":
+        try:
+            idx = int(raw) - 1
+            assert 0 <= idx < len(_KER)
+        except (ValueError, AssertionError):
+            return
+        s["kernel"] = _KER[idx]
+        if _KER[idx] == "custom":
+            s["step"] = "cav"
+            await _build_send(chat_id,
+                "🌟 **Custom – Chọn Android** (gõ số)\n\n"
+                "1. Android 12\n2. Android 13\n3. Android 14\n4. Android 15")
+        else:
+            s["step"] = "variant"
+            wf = _GH_BUILD["workflows"][_KER[idx]]
+            await _build_send(chat_id,
+                f"✅ Kernel: **{wf}**\n\n"
+                "👉 **Chọn Variant** (gõ số)\n\n"
+                + "\n".join(f"{i+1}. {v}" for i, v in enumerate(_VAR)))
+
+    # ── Custom: Android version ───────────────────────────────
+    elif step == "cav":
+        try:
+            idx = int(raw) - 1; assert 0 <= idx < len(_AV)
+        except (ValueError, AssertionError): return
+        s["custom"]["android_version"] = _AV[idx]
+        s["step"] = "ckv"
+        await _build_send(chat_id,
+            f"✅ Android: **{_AV[idx]}**\n\n"
+            "**Chọn Kernel version** (gõ số)\n\n"
+            + "\n".join(f"{i+1}. {v}" for i, v in enumerate(_KV)))
+
+    # ── Custom: Kernel version ────────────────────────────────
+    elif step == "ckv":
+        try:
+            idx = int(raw) - 1; assert 0 <= idx < len(_KV)
+        except (ValueError, AssertionError): return
+        s["custom"]["kernel_version"] = _KV[idx]
+        s["step"] = "csub"
+        await _build_send(chat_id, f"✅ Kernel: **{_KV[idx]}**\n\n📝 Nhập `sub_level` (bắt buộc, vd: `66`):")
+
+    # ── Custom: sub_level ─────────────────────────────────────
+    elif step == "csub":
+        if not raw.isdigit() or int(raw) <= 0:
+            await _build_send(chat_id, "❌ `sub_level` phải là số nguyên dương. Nhập lại:")
+            return
+        av  = s["custom"].get("android_version", "")
+        kv  = s["custom"].get("kernel_version", "")
+        url = (f"https://raw.githubusercontent.com/{_GH_BUILD['owner']}"
+               f"/{_GH_BUILD['repo']}/dev/data/{av}/{kv}.json")
+        fetch_ok = False
+        dates: list[str] = []
+        lts_hint = ""
+        try:
+            sess = await get_http()
+            async with sess.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status == 200:
+                    fetch_ok = True
+                    j = await r.json(content_type=None)
+                    lts_hint = j.get("lts", "")
+                    full_kernel = f"{kv}.{raw}"
+                    dates = [e["date"] for e in j.get("entries", [])
+                             if e.get("kernel") == full_kernel and e.get("date")]
+        except Exception:
+            pass
+
+        if fetch_ok and not dates:
+            hint = f"\n💡 LTS hiện tại: `{lts_hint.split('.')[-1]}`" if lts_hint else ""
+            await _build_send(chat_id,
+                f"❌ `sub_level` **{raw}** không tồn tại.{hint}\n\nNhập lại:")
+            return
+
+        s["custom"]["sub_level"] = raw
+        if dates:
+            s["custom"]["_patch_dates"] = dates
+            s["step"] = "cpatch_sel"
+            menu = "\n".join(f"{i+1}. {d}" for i, d in enumerate(dates))
+            await _build_send(chat_id,
+                f"✅ sub_level: **{raw}**\n\n"
+                f"🗓 Chọn `os_patch_level` (gõ số):\n\n{menu}")
+        else:
+            # fetch thất bại → fallback nhập tay
+            s["step"] = "cpatch"
+            await _build_send(chat_id,
+                f"✅ sub_level: **{raw}**\n\n📝 Nhập `os_patch_level` (vd: `2022-01`, `lts`):")
+
+    # ── Custom: os_patch_level chọn từ menu ───────────────────
+    elif step == "cpatch_sel":
+        dates = s["custom"].pop("_patch_dates", [])
+        try:
+            idx = int(raw) - 1; assert 0 <= idx < len(dates)
+            chosen = dates[idx]
+        except (ValueError, AssertionError):
+            return
+        s["custom"]["os_patch_level"] = chosen
+        raw = chosen  # reuse below
+        if s["custom"].get("kernel_version") == "5.10":
+            s["step"] = "crev"
+            await _build_send(chat_id, f"✅ patch_level: **{chosen}**\n\n📝 Nhập `revision` (vd: `r11`):")
+        else:
+            s["custom"]["revision"] = ""
+            s["step"] = "variant"
+            await _build_send(chat_id,
+                f"✅ patch_level: **{chosen}**\n\n✅ Xong cấu hình Custom!\n\n"
+                "👉 **Chọn Variant** (gõ số)\n\n"
+                + "\n".join(f"{i+1}. {v}" for i, v in enumerate(_VAR)))
+
+    # ── Custom: os_patch_level nhập tay (fallback) ────────────
+    elif step == "cpatch":
+        s["custom"]["os_patch_level"] = raw
+        if s["custom"].get("kernel_version") == "5.10":
+            s["step"] = "crev"
+            await _build_send(chat_id, f"✅ patch_level: **{raw}**\n\n📝 Nhập `revision` (vd: `r11`):")
+        else:
+            s["custom"]["revision"] = ""
+            s["step"] = "variant"
+            await _build_send(chat_id,
+                f"✅ patch_level: **{raw}**\n\n✅ Xong cấu hình Custom!\n\n"
+                "👉 **Chọn Variant** (gõ số)\n\n"
+                + "\n".join(f"{i+1}. {v}" for i, v in enumerate(_VAR)))
+
+    # ── Custom: revision ──────────────────────────────────────
+    elif step == "crev":
+        s["custom"]["revision"] = "" if raw == "-" else raw
+        s["step"] = "variant"
+        await _build_send(chat_id,
+            "✅ Xong cấu hình Custom!\n\n"
+            "👉 **Chọn Variant** (gõ số)\n\n"
+            + "\n".join(f"{i+1}. {v}" for i, v in enumerate(_VAR)))
+
+    # ── Variant ───────────────────────────────────────────────
+    elif step == "variant":
+        try:
+            idx = int(raw) - 1; assert 0 <= idx < len(_VAR)
+        except (ValueError, AssertionError): return
+        s["variant"] = _VAR[idx]
+        s["step"] = "branch"
+        await _build_send(chat_id,
+            f"✅ Variant: **{_VAR[idx]}**\n\n"
+            "🌱 **Chọn KSU Branch** (gõ số)\n\n"
+            + "\n".join(f"{i+1}. {v}" for i, v in enumerate(_BRA)))
+
+    # ── Branch ────────────────────────────────────────────────
+    elif step == "branch":
+        try:
+            idx = int(raw) - 1; assert 0 <= idx < len(_BRA)
+        except (ValueError, AssertionError): return
+        s["branch"] = _BRA[idx]
+        s["step"] = "version"
+        await _build_send(chat_id, f"✅ Branch: **{_BRA[idx]}**\n\n📝 Nhập Version Name (`-` bỏ qua):")
+
+    # ── Version name ──────────────────────────────────────────
+    elif step == "version":
+        s["version"] = "" if raw == "-" else raw
+        s["step"] = "build_time"
+        await _build_send(chat_id,
+            f"✅ Version: **{raw}**\n\n"
+            "🕒 Nhập Build Time:\n`N` = bỏ trống | hoặc nhập thiên văn (vd: `2025-01-01 00:00:00`):")
+
+    # ── Build time ────────────────────────────────────────────
+    elif step == "build_time":
+        s["build_time"] = "" if raw.upper() == "N" else raw
+        s["step"] = "toggles"
+        await _build_send(chat_id, _tog_text(s))
+
+    # ── Toggles ───────────────────────────────────────────────
+    elif step == "toggles":
+        _TOG_KEYS = ["use_zram", "use_bbg", "use_kpm", "cancel_susfs", "supp_op"]
+        is_c = s.get("kernel") == "custom"
+        avail = _TOG_KEYS[:4] + (["supp_op"] if is_c else [])
+        if raw == "0":
+            await _execute_build(chat_id, s.get("_mid"))
+        else:
+            try:
+                idx = int(raw) - 1; assert 0 <= idx < len(avail)
+            except (ValueError, AssertionError): return
+            key = avail[idx]
+            s["toggles"][key] = not s["toggles"][key]
+            await _build_send(chat_id, _tog_text(s))
+
+async def _monitor_build(chat_id: int, workflow: str) -> None:
+    await asyncio.sleep(15)  # Đợi GitHub Actions khởi tạo run
+    url = f"https://api.github.com/repos/{_GH_BUILD['owner']}/{_GH_BUILD['repo']}/actions/workflows/{workflow}/runs?per_page=5"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {_GH_BUILD['token']}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    try:
+        sess = await get_http()
+        async with sess.get(url, headers=headers) as r:
+            if r.status != 200:
+                return
+            data = await r.json(content_type=None)
+            runs = data.get("workflow_runs", [])
+            if not runs:
+                return
+            # Giả định run mới nhất là của chúng ta
+            run_id = runs[0]["id"]
+            run_url = runs[0].get("html_url", "")
+            run_name = runs[0].get("name", workflow)
+    except Exception as e:
+        logging.warning("_monitor_build fetch init error: %s", e)
+        return
+
+    status_url = f"https://api.github.com/repos/{_GH_BUILD['owner']}/{_GH_BUILD['repo']}/actions/runs/{run_id}"
+
+    # Đăng ký event hủy
+    cancel_event = asyncio.Event()
+    _cancel_build_events[chat_id] = cancel_event
+
+    try:
+        while True:
+            # Chờ 30s hoặc cho đến khi có tín hiệu hủy
+            try:
+                await asyncio.wait_for(cancel_event.wait(), timeout=30.0)
+                # Nếu không timeout, tức là cancel_event đã được set -> Ngừng theo dõi
+                break
+            except asyncio.TimeoutError:
+                pass
+
+            try:
+                async with sess.get(status_url, headers=headers) as r:
+                    if r.status != 200:
+                        continue
+                    run_data = await r.json(content_type=None)
+                    status = run_data.get("status")
+                    conclusion = run_data.get("conclusion")
+
+                    if status == "completed":
+                        if conclusion == "success":
+                            nightly = f"https://nightly.link/{_GH_BUILD['owner']}/{_GH_BUILD['repo']}/actions/runs/{run_id}"
+                            msg = f"✅ **{run_name}** đã hoàn tất thành công!\n   └ [📥 Link tải Artifacts (Nightly)]({nightly})"
+                        elif conclusion == "failure":
+                            msg = f"❌ **{run_name}** thất bại!\n   └ [Xem chi tiết]({run_url})"
+                        elif conclusion == "cancelled":
+                            msg = f"🚫 **{run_name}** đã bị hủy.\n   └ [Xem chi tiết]({run_url})"
+                        else:
+                            msg = f"ℹ️ **{run_name}** kết thúc với trạng thái: `{conclusion}`\n   └ [Xem chi tiết]({run_url})"
+
+                        await client.send_message(chat_id, msg)
+                        break
+            except Exception as e:
+                logging.warning("_monitor_build polling error: %s", e)
+                await asyncio.sleep(60)
+    finally:
+        _cancel_build_events.pop(chat_id, None)
+
+async def _execute_build(chat_id: int, msg_id: int | None) -> None:
+    s = _build_sessions.get(chat_id, {})
+    is_custom = s.get("kernel") == "custom"
+    workflow  = _GH_BUILD["workflows"].get(s.get("kernel", ""), "")
+    toggles   = s.get("toggles", {})
+
+    if msg_id:
+        await client.edit_message(chat_id, msg_id, "⏳ Đang gửi lệnh build…")
+
+    inputs: dict[str, str] = {
+        "kernelsu_variant": s.get("variant", ""),
+        "kernelsu_branch":  s.get("branch", ""),
+        "version":          s.get("version", ""),
+        "use_zram":         str(toggles.get("use_zram", True)).lower(),
+        "use_bbg":          str(toggles.get("use_bbg",  True)).lower(),
+        "use_kpm":          str(toggles.get("use_kpm",  True)).lower(),
+        "cancel_susfs":     str(toggles.get("cancel_susfs", False)).lower(),
+        "build_time":       s.get("build_time", ""),
+    }
+    if is_custom:
+        c = s.get("custom", {})
+        inputs.update({
+            "android_version": c.get("android_version", ""),
+            "kernel_version":  c.get("kernel_version", ""),
+            "sub_level":       c.get("sub_level", ""),
+            "os_patch_level":  c.get("os_patch_level", ""),
+            "revision":        c.get("revision", ""),
+            "supp_op":         str(toggles.get("supp_op", False)).lower(),
+        })
+    else:
+        inputs["sub_levels"] = ""
+
+    url = f"https://api.github.com/repos/{_GH_BUILD['owner']}/{_GH_BUILD['repo']}/actions/workflows/{workflow}/dispatches"
+    headers = _gh_headers()
+    payload = {"ref": _GH_BUILD["ref"], "inputs": inputs}
+
+    is_ok = False
+    try:
+        sess = await get_http()
+        async with sess.post(url, json=payload, headers=headers) as resp:
+            is_ok = resp.status in (200, 204)
+            result = (
+                "✅ Đã gửi lệnh build. Bot sẽ thông báo khi hoàn tất."
+                if is_ok
+                else f"❌ **GitHub API lỗi {resp.status}:**\n`{(await resp.text())[:300]}`"
+            )
+    except Exception as exc:
+        result = f"❌ Request failed: {exc}"
+    finally:
+        _build_sessions.pop(chat_id, None)
+
+    if msg_id:
+        await client.edit_message(chat_id, msg_id, result)
+    else:
+        await client.send_message(chat_id, result)
+
+    if is_ok:
+        asyncio.create_task(_monitor_build(chat_id, workflow))
+
+@client.on(events.NewMessage(pattern=pat("stop"), outgoing=True))
+async def cmd_build_stop(e):
+    chat_id = e.chat_id
+    args = (e.raw_text or "").split()
+    target_id = args[1] if len(args) > 1 else None
+
+    _build_sessions.pop(chat_id, None)
+    if chat_id in _cancel_build_events:
+        _cancel_build_events[chat_id].set()
+
+    msg = await client.send_message(chat_id, "⏳ Đang tìm và hủy build trên GitHub...")
+
+    url = f"https://api.github.com/repos/{_GH_BUILD['owner']}/{_GH_BUILD['repo']}/actions/runs?per_page=15"
+    headers = _gh_headers()
+
+    try:
+        data = await _fetch_json(url, headers=headers)
+        if not data:
+            return await client.edit_message(chat_id, msg.id, "❌ Lỗi lấy danh sách build")
+
+        runs = data.get("workflow_runs", [])
+        in_progress = [r for r in runs if r.get("status") in ("in_progress", "queued", "waiting")]
+
+        if not in_progress:
+            return await client.edit_message(chat_id, msg.id, "⚠️ Không có build nào đang chạy trên GitHub.")
+
+        target_run = None
+        if target_id:
+            for r in in_progress:
+                if str(r.get("id")) == target_id:
+                    target_run = r
+                    break
+            if not target_run:
+                 return await client.edit_message(chat_id, msg.id, f"⚠️ Không tìm thấy build `{target_id}` đang chạy.")
+        elif len(in_progress) > 1:
+            msg_text = "⚠️ **Có nhiều build đang chạy.**\n\n"
+            for r in in_progress:
+                r_id = r["id"]
+                r_name = r.get("name", "Unknown")
+                msg_text += f"• `{r_id}` - **{r_name}**\n"
+            msg_text += "\n👉 Gửi `/stop ID` để hủy hoặc `/cancel` để bỏ qua."
+            return await client.edit_message(chat_id, msg.id, msg_text)
+        else:
+            target_run = in_progress[0]
+
+        if not target_run:
+            return
+
+        run_id = target_run["id"]
+        wf_name = target_run.get("name", "Unknown")
+
+        cancel_url = f"https://api.github.com/repos/{_GH_BUILD['owner']}/{_GH_BUILD['repo']}/actions/runs/{run_id}/cancel"
+        sess = await get_http()
+        async with sess.post(cancel_url, headers=headers) as cancel_resp:
+            if cancel_resp.status in (202, 200):
+                await client.edit_message(chat_id, msg.id, f"🛑 Đã gửi lệnh hủy build: **{wf_name}**")
+            else:
+                err = (await cancel_resp.text())[:100]
+                await client.edit_message(chat_id, msg.id, f"❌ Lỗi khi hủy build: {cancel_resp.status}\n{err}")
+    except Exception as exc:
+        await client.edit_message(chat_id, msg.id, f"❌ Lỗi: {exc}")
+
+@client.on(events.CallbackQuery(pattern=b"^stop_run:(.*)$"))
+async def _cb_stop_run(e):
+    chat_id = e.chat_id
+    run_id = e.pattern_match.group(1).decode("utf-8")
+
+    if run_id == "cancel":
+        await e.edit("🛑 Đã hủy thao tác.")
+        return
+
+    await e.edit(f"⏳ Đang gửi lệnh hủy build `{run_id}`...")
+    url = f"https://api.github.com/repos/{_GH_BUILD['owner']}/{_GH_BUILD['repo']}/actions/runs/{run_id}/cancel"
+    headers = _gh_headers()
+    try:
+        sess = await get_http()
+        async with sess.post(url, headers=headers) as resp:
+            if resp.status in (202, 200):
+                await e.edit(f"🛑 Đã gửi lệnh hủy build: `{run_id}`")
+            else:
+                err = (await resp.text())[:100]
+                await e.edit(f"❌ Lỗi khi hủy build: {resp.status}\n{err}")
+    except Exception as exc:
+        await e.edit(f"❌ Lỗi: {exc}")
+
+@client.on(events.NewMessage(pattern=pat("list"), outgoing=True))
+async def cmd_build_list(e):
+    await e.edit("⏳ Đang lấy danh sách runs…")
+    url = (f"https://api.github.com/repos/{_GH_BUILD['owner']}/{_GH_BUILD['repo']}"
+           f"/actions/runs?per_page=10")
+    headers = {
+        "Accept":               "application/vnd.github+json",
+        "Authorization":        f"Bearer {_GH_BUILD['token']}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    _ICON = {
+        ("completed",   "success"):   "✅",
+        ("completed",   "failure"):   "❌",
+        ("completed",   "cancelled"): "🚫",
+        ("in_progress", ""):           "🔄",
+        ("queued",      ""):           "🕒",
+    }
+    try:
+        sess = await get_http()
+        async with sess.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                return await safe_edit(e, f"❌ GitHub API lỗi {resp.status}")
+            runs = (await resp.json(content_type=None)).get("workflow_runs", [])
+            if not runs:
+                return await safe_edit(e, "Không có runs nào.")
+
+            lines = [f"**{_GH_BUILD['repo']} – Tình trạng Build**\n"]
+            for r in runs:
+                st  = r.get("status", "")
+                cl  = r.get("conclusion") or ""
+                wf  = r.get("name", "?")
+                url_run = r.get("html_url", "")
+                run_id = r.get("id", "")
+
+                if st in ("in_progress", "queued", "waiting"):
+                    lines.append(f"🔄 **{wf}** (`{run_id}`) — `Đang build...`\n   └ [Xem Progress]({url_run})")
+                elif cl == "success":
+                    nightly = f"https://nightly.link/{_GH_BUILD['owner']}/{_GH_BUILD['repo']}/actions/runs/{run_id}"
+                    lines.append(f"✅ **{wf}** — `Thành công`\n   └ [📥 Link tải Artifacts]({nightly})")
+                elif cl in ("failure", "cancelled"):
+                    ico = "❌" if cl == "failure" else "🚫"
+                    lines.append(f"{ico} **{wf}** — `{cl}`\n   └ [Xem chi tiết]({url_run})")
+                else:
+                    lines.append(f"❔ **{wf}** — `{st}`")
+
+            await safe_edit(e, "\n".join(lines))
+    except Exception as exc:
+        await safe_edit(e, f"❌ Request failed: {exc}")
+
 # ─────────────────────────────────────────────────────────────
 # Shutdown / Main
 # ─────────────────────────────────────────────────────────────
@@ -597,8 +1324,11 @@ async def main() -> None:
         await close_http()
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
     try:
-        loop.run_until_complete(main())
+        if sys.version_info >= (3, 11):
+            with asyncio.Runner(loop_factory=asyncio.new_event_loop) as runner:
+                runner.run(main())
+        else:
+            asyncio.run(main())
     except KeyboardInterrupt:
         pass
