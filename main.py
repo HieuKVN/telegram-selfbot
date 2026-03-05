@@ -13,9 +13,9 @@ import unicodedata
 from datetime import datetime
 from hashlib import sha256
 from typing import Any, Optional
+from zoneinfo import ZoneInfo  # Dùng thư viện chuẩn thay cho pytz
 
 import aiohttp
-import pytz
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import MessageNotModifiedError
@@ -42,7 +42,8 @@ API_ID = int(_require("API_ID"))
 API_HASH = _require("API_HASH")
 PREFIX = _require("PREFIX")
 CITY = _require("CITY")
-TZ = pytz.timezone(_require("TZ"))
+TZ_STR = _require("TZ")
+TZ = ZoneInfo(TZ_STR)  # Sử dụng ZoneInfo chuẩn
 OW_KEY = os.getenv("OW_KEY", "").strip()
 VT_KEY = os.getenv("VT_KEY", "").strip()
 GH_TOKEN = os.getenv("GH_TOKEN", "").strip()
@@ -83,7 +84,7 @@ def _normalize(name: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", name).casefold().split())
 
 def _esc(s: str) -> str:
-    return s.replace("`", "｀")
+    return s.replace("`", "｀")  # Đã sửa lỗi replace string rỗng
 
 async def safe_edit(e, text: str) -> None:
     try:
@@ -128,7 +129,7 @@ async def _fetch_json(url: str, method: str = "GET", **kwargs) -> Optional[dict]
     s = await get_http()
     try:
         async with s.request(method, url, **kwargs) as r:
-            if r.status not in (200, 202, 404):
+            if r.status not in (200, 201, 202, 204, 404):
                 return None
             return await r.json(content_type=None)
     except Exception as exc:
@@ -276,6 +277,11 @@ HELP = "\n".join(
         f"`{PREFIX}get <name>`           — forward saved note",
         f"`{PREFIX}delnote <name>`       — delete a saved note",
         f"`{PREFIX}rename <old> | <new>` — rename a saved note",
+        "",
+        "**GKI Builder:**",
+        f"`{PREFIX}build`   — start build wizard",
+        f"`{PREFIX}list`    — list GitHub runs",
+        f"`{PREFIX}stop`    — cancel current/monitoring build",
     ]
 )
 
@@ -294,7 +300,7 @@ async def cmd_ping(e):
 async def cmd_uptime(e):
     h, r = divmod(int(time.time() - _start_time), 3600)
     m, s = divmod(r, 60)
-    await _reply(e, f"Uptime: `{h:02d}:{m:02d}:{s:02d}`")
+    await _reply(e, f"Uptime: {h:02d}:{m:02d}:{s:02d}")
 
 @client.on(events.NewMessage(pattern=pat("del"), outgoing=True))
 async def cmd_del(e):
@@ -359,14 +365,14 @@ async def cmd_virus(e):
         return await _reply(e, "VT request failed or HTTP error.")
 
     if "data" not in data:
-        return await _reply(e, f"Not found on VT\n`{h}`")
+        return await _reply(e, f"Not found on VT\n{h}")
 
     st = data["data"]["attributes"]["last_analysis_stats"]
     mal = st.get("malicious", 0)
     sus = st.get("suspicious", 0)
     und = st.get("undetected", 0)
     verdict = "Clean" if mal == 0 and sus == 0 else "Detected"
-    await _reply(e, f"{verdict}  mal:`{mal}` sus:`{sus}` und:`{und}`\n`{h}`")
+    await _reply(e, f"{verdict}  mal:{mal} sus:{sus} und:{und}\n{h}")
 
 @client.on(events.NewMessage(pattern=pat("rebio"), outgoing=True))
 async def cmd_rebio(e):
@@ -391,7 +397,7 @@ async def cmd_reload(e):
 async def cmd_save(e):
     arg = (e.pattern_match.group(1) or "").strip()
     if not arg:
-        return await _reply(e, f"Usage: `{PREFIX}save <name>` (reply to a message)")
+        return await _reply(e, f"Usage: {PREFIX}save <name> (reply to a message)")
     if not e.is_reply:
         return await _reply(e, "Reply to a message to save it.")
 
@@ -409,7 +415,7 @@ async def cmd_save(e):
         show = _esc((_notes_index[norm].get("name") or name).replace("\n", " "))
         return await _reply(
             e,
-            f"Note `{show}` already exists.\nDelete first: `{PREFIX}delnote {show}`",
+            f"Note {show} already exists.\nDelete first: {PREFIX}delnote {show}",
         )
 
     try:
@@ -443,7 +449,7 @@ async def cmd_save(e):
         await client.send_message("me", tag_line, reply_to=msg.id)
         _notes_index[norm] = {"id": msg.id, "name": name}
         _save_notes_index()
-        await _reply(e, f"Saved: `{_esc(name)}`")
+        await _reply(e, f"Saved: {_esc(name)}")
     except Exception as exc:
         await _reply(e, f"Save failed: {exc}")
 
@@ -454,15 +460,15 @@ async def cmd_saved(e):
             await e.edit("Rebuilding index…")
             await _rebuild_notes_index()
         if not _notes_index:
-            return await _reply(e, f"No saved notes. Use `{PREFIX}save <name>`.")
+            return await _reply(e, f"No saved notes. Use {PREFIX}save <name>.")
 
         items = sorted(_notes_index.values(), key=lambda x: _normalize(x.get("name", "")))
         lines = ["**Saved Notes:**\n"]
         for it in items[:80]:
-            lines.append(f"• `{_esc(it.get('name', '') or '')}`")
+            lines.append(f"• {_esc(it.get('name', '') or '')}")
         if len(items) > 80:
             lines.append(f"\nShowing 80/{len(items)}")
-        lines.append(f"\nTotal: {len(items)}  —  `{PREFIX}get <name>` to send")
+        lines.append(f"\nTotal: {len(items)}  —  {PREFIX}get <name> to send")
         await _reply(e, "\n".join(lines))
     except Exception as exc:
         await _reply(e, f"Error: {exc}")
@@ -472,7 +478,7 @@ async def cmd_get(e):
     await _ensure_index()
     arg = (e.pattern_match.group(1) or "").strip()
     if not arg:
-        return await _reply(e, f"Usage: `{PREFIX}get <name>`")
+        return await _reply(e, f"Usage: {PREFIX}get <name>")
 
     norm = _normalize(arg)
     entry = _notes_index.get(norm)
@@ -480,7 +486,7 @@ async def cmd_get(e):
         await _rebuild_notes_index()
         entry = _notes_index.get(norm)
     if not entry:
-        return await _reply(e, f"Note `{_esc(arg)}` not found.")
+        return await _reply(e, f"Note {_esc(arg)} not found.")
 
     msg = await client.get_messages("me", ids=entry["id"])
     if not msg:
@@ -499,7 +505,7 @@ async def cmd_rename(e):
     await _ensure_index()
     arg = (e.pattern_match.group(1) or "").strip()
     if "|" not in arg:
-        return await _reply(e, f"Usage: `{PREFIX}rename old | new`")
+        return await _reply(e, f"Usage: {PREFIX}rename old | new")
 
     old_name, new_name = (p.strip() for p in arg.split("|", 1))
     if not old_name or not new_name:
@@ -510,9 +516,9 @@ async def cmd_rename(e):
     entry = _notes_index.get(old_norm)
 
     if not entry:
-        return await _reply(e, f"Note `{_esc(old_name)}` not found.")
+        return await _reply(e, f"Note {_esc(old_name)} not found.")
     if new_norm in _notes_index:
-        return await _reply(e, f"Note `{_esc(new_name)}` already exists.")
+        return await _reply(e, f"Note {_esc(new_name)} already exists.")
 
     _notes_index.pop(old_norm)
     _notes_index[new_norm] = {"id": entry["id"], "name": new_name}
@@ -531,19 +537,19 @@ async def cmd_rename(e):
     except Exception:
         pass
 
-    await _reply(e, f"Renamed `{_esc(old_name)}` → `{_esc(new_name)}`")
+    await _reply(e, f"Renamed {_esc(old_name)} → {_esc(new_name)}")
 
 @client.on(events.NewMessage(pattern=pat("delnote"), outgoing=True))
 async def cmd_delnote(e):
     await _ensure_index()
     arg = (e.pattern_match.group(1) or "").strip()
     if not arg:
-        return await _reply(e, f"Usage: `{PREFIX}delnote <name>`")
+        return await _reply(e, f"Usage: {PREFIX}delnote <name>")
 
     norm = _normalize(arg)
     entry = _notes_index.pop(norm, None)
     if not entry:
-        return await _reply(e, f"Note `{_esc(arg)}` not found.")
+        return await _reply(e, f"Note {_esc(arg)} not found.")
 
     _save_notes_index()
     try:
@@ -560,7 +566,7 @@ async def cmd_delnote(e):
     except Exception:
         pass
 
-    await _reply(e, f"Deleted: `{_esc(arg)}`")
+    await _reply(e, f"Deleted: {_esc(arg)}")
 
 _LATEST_YML = "https://raw.githubusercontent.com/XiaomiFirmwareUpdater/miui-updates-tracker/master/data/latest.yml"
 
@@ -578,11 +584,11 @@ async def cmd_miui(e):
     }
     _VALID_REGIONS = tuple(_REGION_MAP)
     if not model:
-        return await _reply(e, f"Usage: `{PREFIX}miui <model> [{'|'.join(_VALID_REGIONS)}]`")
+        return await _reply(e, f"Usage: {PREFIX}miui <model> [{'|'.join(_VALID_REGIONS)}]")
     if region_filter not in _VALID_REGIONS:
-        return await _reply(e, f"Usage: `{PREFIX}miui <model> [{'|'.join(_VALID_REGIONS)}]`")
+        return await _reply(e, f"Usage: {PREFIX}miui <model> [{'|'.join(_VALID_REGIONS)}]")
 
-    await e.edit(f"🔍 Fetching firmware for `{model}`{' (' + region_filter + ')' if region_filter else ''}…")
+    await e.edit(f"🔍 Fetching firmware for {model}{' (' + region_filter + ')' if region_filter else ''}…")
 
     try:
         yml_text = await _fetch_text(_LATEST_YML, timeout=aiohttp.ClientTimeout(total=20))
@@ -591,9 +597,8 @@ async def cmd_miui(e):
     except Exception as exc:
         return await safe_edit(e, f"Request failed: {exc}")
 
-    # Quick check: does codename exist in the file at all?
     if f"codename: {model}" not in yml_text:
-        return await safe_edit(e, f"Model `{model}` not found.")
+        return await safe_edit(e, f"Model {model} not found.")
 
     def _os_gen(ver: str) -> str:
         v = ver.upper()
@@ -606,11 +611,9 @@ async def cmd_miui(e):
         m = re.search(rf"(?:^|\n)\s*{key}:\s*['\"]?([^'\"\n]+)['\"]?", block)
         return m.group(1).strip() if m else ""
 
-    # Parse YAML: split on list-item boundaries
     raw_blocks = re.split(r"\n(?=- android:)", yml_text)
     device_name = model
 
-    # Two-pass: prefer Stable, fall back to any branch (Dev/Beta) if gen missing
     best_stable: dict[str, dict] = {}
     best_any:    dict[str, dict] = {}
 
@@ -640,13 +643,11 @@ async def cmd_miui(e):
         date    = _yml_field(blk, "date")
         branch  = _yml_field(blk, "branch")
 
-        # Device display name
         if device_name == model and name:
             device_name = re.sub(r"\s+(China|Global|India|Russia|Taiwan|Turkey|Indonesia|EEA|Japan|DC|EU)$", "", name, flags=re.IGNORECASE).strip()
 
-        # Region filter: match name field against keyword
         name_lower = name.lower()
-        region_kw = _REGION_MAP[region_filter]  # e.g. 'eea', 'india', 'china'
+        region_kw = _REGION_MAP[region_filter]
         if region_kw not in name_lower:
             continue
 
@@ -661,7 +662,6 @@ async def cmd_miui(e):
 
     # ── Source 2: hyperos.fans (HyperOS OS1/OS2/OS3 full history) ────────────
     _HYPEROS_API = "https://data.hyperos.fans/devices/{}.json"
-    # Strip region suffix from model to get base codename (e.g. "nuwa_global" → "nuwa")
     base_model = model.split("_")[0]
     try:
         hdata = await _fetch_json(_HYPEROS_API.format(base_model), timeout=aiohttp.ClientTimeout(total=10))
@@ -674,16 +674,14 @@ async def cmd_miui(e):
                 if br_region != tagmap.get(region_filter, region_filter):
                     continue
                 is_stable = br.get("branchtag") == "F"
-                br_name   = (br.get("name") or {}).get("en", "")
                 roms = br.get("roms") or {}
                 for ver_str, info in roms.items():
                     gen = _os_gen(ver_str)
                     if gen == "MIUI":
-                        continue  # MIUI handled by latest.yml
+                        continue
                     android  = info.get("android") or ""
                     rec_file = info.get("recovery") or ""
                     rel_date = info.get("release") or ""
-                    # Build download link
                     link = f"https://bigota.d.miui.com/{ver_str}/{rec_file}" if rec_file else ""
                     if not link and info.get("fastboot"):
                         fb = info["fastboot"]
@@ -697,9 +695,8 @@ async def cmd_miui(e):
                     if is_stable:
                         _update_best(best_stable, gen, candidate)
     except Exception:
-        pass  # hyperos.fans failure is non-fatal
+        pass
 
-    # Merge: stable wins; fallback to any if gen has no stable
     gen_best = {**best_any, **best_stable}
 
     def _av_key(d: dict) -> float:
@@ -711,7 +708,7 @@ async def cmd_miui(e):
     sorted_entries = sorted(gen_best.values(), key=_av_key)
 
     if not sorted_entries:
-        return await safe_edit(e, f"No stable firmware found for `{model}`{' (' + region_filter + ')' if region_filter else ''}.")
+        return await safe_edit(e, f"No stable firmware found for {model}{' (' + region_filter + ')' if region_filter else ''}.")
 
     region_label = f" ({region_filter.upper()})" if region_filter else ""
     header = f"**Latest firmware for {device_name} ({model}){region_label}:**"
@@ -759,7 +756,7 @@ _GH_BUILD = {
 }
 
 _build_sessions: dict[int, dict] = {}
-_own_msgs:        set[int]        = set()  # IDs of messages sent by the bot itself
+_own_msgs:        set[int]        = set()
 _KER  = ["a12", "a13", "a14", "a15", "custom"]
 _VAR  = ["Official", "Next", "MKSU", "SukiSU", "ReSukiSU"]
 _BRA  = ["Stable(标准)", "Dev(开发)", "Other(其他/指定)"]
@@ -780,7 +777,7 @@ def _tog_text(s: dict) -> str:
     t = s["toggles"]
     is_c = s.get("kernel") == "custom"
     lines = [
-        "⚙️ **Tùy chỉnh tính năng** (gõ số để toggle, `0` để BUILD):\n",
+        "⚙️ **Tùy chỉnh tính năng** (gõ số để toggle, 0 để BUILD):\n",
         f"1. ZRAM:         {_ic(t['use_zram'])}",
         f"2. BBG:          {_ic(t['use_bbg'])}",
         f"3. KPM:          {_ic(t['use_kpm'])}",
@@ -788,7 +785,7 @@ def _tog_text(s: dict) -> str:
     ]
     if is_c:
         lines.append(f"5. OnePlus 8E:  {_ic(t['supp_op'])}")
-    lines.append("\n`0` → 🚀 GỬI BUILD")
+    lines.append("\n0 → 🚀 GỬI BUILD")
     return "\n".join(lines)
 
 async def _build_send(chat_id: int, text: str) -> None:
@@ -810,11 +807,11 @@ async def _build_send(chat_id: int, text: str) -> None:
 async def cmd_build(e):
     chat_id = e.chat_id
     if chat_id in _build_sessions:
-        await e.edit("⚠️ Đang có build session. Gõ `.stop` để hủy trước.")
+        await e.edit("⚠️ Đang có build session. Gõ .stop để hủy trước.")
         return
 
     msg = await client.send_message(chat_id,
-        "🛠 **Bước 1: Chọn loại Build** (gõ số, `q` = thoát)\n\n"
+        "🛠 **Bước 1: Chọn loại Build** (gõ số, q = thoát)\n\n"
         "1. A12 (5.10)\n2. A13 (5.15)\n3. A14 (6.1)\n4. A15 (6.6)\n5. Custom")
     _own_msgs.add(msg.id)
     _build_sessions[chat_id] = {
@@ -835,12 +832,11 @@ async def _build_input(e):
     step = s["step"]
     raw = (e.raw_text or "").strip()
 
-    # q = thoát bất kỳ lúc nào
     if raw.lower() == "q":
         _build_sessions.pop(chat_id, None)
         await client.send_message(chat_id, "🛑 Đã hủy build.")
         return
-    # ── Kernel ────────────────────────────────────────────────
+
     if step == "kernel":
         try:
             idx = int(raw) - 1
@@ -861,7 +857,6 @@ async def _build_input(e):
                 "👉 **Chọn Variant** (gõ số)\n\n"
                 + "\n".join(f"{i+1}. {v}" for i, v in enumerate(_VAR)))
 
-    # ── Custom: Android version ───────────────────────────────
     elif step == "cav":
         try:
             idx = int(raw) - 1; assert 0 <= idx < len(_AV)
@@ -873,19 +868,17 @@ async def _build_input(e):
             "**Chọn Kernel version** (gõ số)\n\n"
             + "\n".join(f"{i+1}. {v}" for i, v in enumerate(_KV)))
 
-    # ── Custom: Kernel version ────────────────────────────────
     elif step == "ckv":
         try:
             idx = int(raw) - 1; assert 0 <= idx < len(_KV)
         except (ValueError, AssertionError): return
         s["custom"]["kernel_version"] = _KV[idx]
         s["step"] = "csub"
-        await _build_send(chat_id, f"✅ Kernel: **{_KV[idx]}**\n\n📝 Nhập `sub_level` (bắt buộc, vd: `66`):")
+        await _build_send(chat_id, f"✅ Kernel: **{_KV[idx]}**\n\n📝 Nhập sub_level (bắt buộc, vd: 66):")
 
-    # ── Custom: sub_level ─────────────────────────────────────
     elif step == "csub":
         if not raw.isdigit() or int(raw) <= 0:
-            await _build_send(chat_id, "❌ `sub_level` phải là số nguyên dương. Nhập lại:")
+            await _build_send(chat_id, "❌ sub_level phải là số nguyên dương. Nhập lại:")
             return
         av  = s["custom"].get("android_version", "")
         kv  = s["custom"].get("kernel_version", "")
@@ -908,9 +901,9 @@ async def _build_input(e):
             pass
 
         if fetch_ok and not dates:
-            hint = f"\n💡 LTS hiện tại: `{lts_hint.split('.')[-1]}`" if lts_hint else ""
+            hint = f"\n💡 LTS hiện tại: {lts_hint.split('.')[-1]}" if lts_hint else ""
             await _build_send(chat_id,
-                f"❌ `sub_level` **{raw}** không tồn tại.{hint}\n\nNhập lại:")
+                f"❌ sub_level **{raw}** không tồn tại.{hint}\n\nNhập lại:")
             return
 
         s["custom"]["sub_level"] = raw
@@ -920,14 +913,12 @@ async def _build_input(e):
             menu = "\n".join(f"{i+1}. {d}" for i, d in enumerate(dates))
             await _build_send(chat_id,
                 f"✅ sub_level: **{raw}**\n\n"
-                f"🗓 Chọn `os_patch_level` (gõ số):\n\n{menu}")
+                f"🗓 Chọn os_patch_level (gõ số):\n\n{menu}")
         else:
-            # fetch thất bại → fallback nhập tay
             s["step"] = "cpatch"
             await _build_send(chat_id,
-                f"✅ sub_level: **{raw}**\n\n📝 Nhập `os_patch_level` (vd: `2022-01`, `lts`):")
+                f"✅ sub_level: **{raw}**\n\n📝 Nhập os_patch_level (vd: 2022-01, lts):")
 
-    # ── Custom: os_patch_level chọn từ menu ───────────────────
     elif step == "cpatch_sel":
         dates = s["custom"].pop("_patch_dates", [])
         try:
@@ -936,10 +927,10 @@ async def _build_input(e):
         except (ValueError, AssertionError):
             return
         s["custom"]["os_patch_level"] = chosen
-        raw = chosen  # reuse below
+        raw = chosen
         if s["custom"].get("kernel_version") == "5.10":
             s["step"] = "crev"
-            await _build_send(chat_id, f"✅ patch_level: **{chosen}**\n\n📝 Nhập `revision` (vd: `r11`):")
+            await _build_send(chat_id, f"✅ patch_level: **{chosen}**\n\n📝 Nhập revision (vd: r11):")
         else:
             s["custom"]["revision"] = ""
             s["step"] = "variant"
@@ -948,12 +939,11 @@ async def _build_input(e):
                 "👉 **Chọn Variant** (gõ số)\n\n"
                 + "\n".join(f"{i+1}. {v}" for i, v in enumerate(_VAR)))
 
-    # ── Custom: os_patch_level nhập tay (fallback) ────────────
     elif step == "cpatch":
         s["custom"]["os_patch_level"] = raw
         if s["custom"].get("kernel_version") == "5.10":
             s["step"] = "crev"
-            await _build_send(chat_id, f"✅ patch_level: **{raw}**\n\n📝 Nhập `revision` (vd: `r11`):")
+            await _build_send(chat_id, f"✅ patch_level: **{raw}**\n\n📝 Nhập revision (vd: r11):")
         else:
             s["custom"]["revision"] = ""
             s["step"] = "variant"
@@ -962,7 +952,6 @@ async def _build_input(e):
                 "👉 **Chọn Variant** (gõ số)\n\n"
                 + "\n".join(f"{i+1}. {v}" for i, v in enumerate(_VAR)))
 
-    # ── Custom: revision ──────────────────────────────────────
     elif step == "crev":
         s["custom"]["revision"] = "" if raw == "-" else raw
         s["step"] = "variant"
@@ -971,7 +960,6 @@ async def _build_input(e):
             "👉 **Chọn Variant** (gõ số)\n\n"
             + "\n".join(f"{i+1}. {v}" for i, v in enumerate(_VAR)))
 
-    # ── Variant ───────────────────────────────────────────────
     elif step == "variant":
         try:
             idx = int(raw) - 1; assert 0 <= idx < len(_VAR)
@@ -983,30 +971,26 @@ async def _build_input(e):
             "🌱 **Chọn KSU Branch** (gõ số)\n\n"
             + "\n".join(f"{i+1}. {v}" for i, v in enumerate(_BRA)))
 
-    # ── Branch ────────────────────────────────────────────────
     elif step == "branch":
         try:
             idx = int(raw) - 1; assert 0 <= idx < len(_BRA)
         except (ValueError, AssertionError): return
         s["branch"] = _BRA[idx]
         s["step"] = "version"
-        await _build_send(chat_id, f"✅ Branch: **{_BRA[idx]}**\n\n📝 Nhập Version Name (`-` bỏ qua):")
+        await _build_send(chat_id, f"✅ Branch: **{_BRA[idx]}**\n\n📝 Nhập Version Name (- bỏ qua):")
 
-    # ── Version name ──────────────────────────────────────────
     elif step == "version":
         s["version"] = "" if raw == "-" else raw
         s["step"] = "build_time"
         await _build_send(chat_id,
             f"✅ Version: **{raw}**\n\n"
-            "🕒 Nhập Build Time:\n`N` = bỏ trống | hoặc nhập thiên văn (vd: `2025-01-01 00:00:00`):")
+            "🕒 Nhập Build Time:\nN = bỏ trống | hoặc nhập thiên văn (vd: 2025-01-01 00:00:00):")
 
-    # ── Build time ────────────────────────────────────────────
     elif step == "build_time":
         s["build_time"] = "" if raw.upper() == "N" else raw
         s["step"] = "toggles"
         await _build_send(chat_id, _tog_text(s))
 
-    # ── Toggles ───────────────────────────────────────────────
     elif step == "toggles":
         _TOG_KEYS = ["use_zram", "use_bbg", "use_kpm", "cancel_susfs", "supp_op"]
         is_c = s.get("kernel") == "custom"
@@ -1022,13 +1006,9 @@ async def _build_input(e):
             await _build_send(chat_id, _tog_text(s))
 
 async def _monitor_build(chat_id: int, workflow: str) -> None:
-    await asyncio.sleep(15)  # Đợi GitHub Actions khởi tạo run
+    await asyncio.sleep(15)
     url = f"https://api.github.com/repos/{_GH_BUILD['owner']}/{_GH_BUILD['repo']}/actions/workflows/{workflow}/runs?per_page=5"
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {_GH_BUILD['token']}",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
+    headers = _gh_headers()
 
     try:
         sess = await get_http()
@@ -1039,7 +1019,6 @@ async def _monitor_build(chat_id: int, workflow: str) -> None:
             runs = data.get("workflow_runs", [])
             if not runs:
                 return
-            # Giả định run mới nhất là của chúng ta
             run_id = runs[0]["id"]
             run_url = runs[0].get("html_url", "")
             run_name = runs[0].get("name", workflow)
@@ -1049,16 +1028,13 @@ async def _monitor_build(chat_id: int, workflow: str) -> None:
 
     status_url = f"https://api.github.com/repos/{_GH_BUILD['owner']}/{_GH_BUILD['repo']}/actions/runs/{run_id}"
 
-    # Đăng ký event hủy
     cancel_event = asyncio.Event()
     _cancel_build_events[chat_id] = cancel_event
 
     try:
         while True:
-            # Chờ 30s hoặc cho đến khi có tín hiệu hủy
             try:
                 await asyncio.wait_for(cancel_event.wait(), timeout=30.0)
-                # Nếu không timeout, tức là cancel_event đã được set -> Ngừng theo dõi
                 break
             except asyncio.TimeoutError:
                 pass
@@ -1080,7 +1056,7 @@ async def _monitor_build(chat_id: int, workflow: str) -> None:
                         elif conclusion == "cancelled":
                             msg = f"🚫 **{run_name}** đã bị hủy.\n   └ [Xem chi tiết]({run_url})"
                         else:
-                            msg = f"ℹ️ **{run_name}** kết thúc với trạng thái: `{conclusion}`\n   └ [Xem chi tiết]({run_url})"
+                            msg = f"ℹ️ **{run_name}** kết thúc với trạng thái: {conclusion}\n   └ [Xem chi tiết]({run_url})"
 
                         await client.send_message(chat_id, msg)
                         break
@@ -1134,7 +1110,7 @@ async def _execute_build(chat_id: int, msg_id: int | None) -> None:
             result = (
                 "✅ Đã gửi lệnh build. Bot sẽ thông báo khi hoàn tất."
                 if is_ok
-                else f"❌ **GitHub API lỗi {resp.status}:**\n`{(await resp.text())[:300]}`"
+                else f"❌ **GitHub API lỗi {resp.status}:**\n{(await resp.text())[:300]}"
             )
     except Exception as exc:
         result = f"❌ Request failed: {exc}"
@@ -1182,14 +1158,14 @@ async def cmd_build_stop(e):
                     target_run = r
                     break
             if not target_run:
-                 return await client.edit_message(chat_id, msg.id, f"⚠️ Không tìm thấy build `{target_id}` đang chạy.")
+                 return await client.edit_message(chat_id, msg.id, f"⚠️ Không tìm thấy build {target_id} đang chạy.")
         elif len(in_progress) > 1:
             msg_text = "⚠️ **Có nhiều build đang chạy.**\n\n"
             for r in in_progress:
                 r_id = r["id"]
                 r_name = r.get("name", "Unknown")
-                msg_text += f"• `{r_id}` - **{r_name}**\n"
-            msg_text += "\n👉 Gửi `/stop ID` để hủy hoặc `/cancel` để bỏ qua."
+                msg_text += f"• {r_id} - **{r_name}**\n"
+            msg_text += "\n👉 Gửi /stop ID để hủy hoặc /cancel để bỏ qua."
             return await client.edit_message(chat_id, msg.id, msg_text)
         else:
             target_run = in_progress[0]
@@ -1220,14 +1196,14 @@ async def _cb_stop_run(e):
         await e.edit("🛑 Đã hủy thao tác.")
         return
 
-    await e.edit(f"⏳ Đang gửi lệnh hủy build `{run_id}`...")
+    await e.edit(f"⏳ Đang gửi lệnh hủy build {run_id}...")
     url = f"https://api.github.com/repos/{_GH_BUILD['owner']}/{_GH_BUILD['repo']}/actions/runs/{run_id}/cancel"
     headers = _gh_headers()
     try:
         sess = await get_http()
         async with sess.post(url, headers=headers) as resp:
             if resp.status in (202, 200):
-                await e.edit(f"🛑 Đã gửi lệnh hủy build: `{run_id}`")
+                await e.edit(f"🛑 Đã gửi lệnh hủy build: {run_id}")
             else:
                 err = (await resp.text())[:100]
                 await e.edit(f"❌ Lỗi khi hủy build: {resp.status}\n{err}")
@@ -1239,18 +1215,8 @@ async def cmd_build_list(e):
     await e.edit("⏳ Đang lấy danh sách runs…")
     url = (f"https://api.github.com/repos/{_GH_BUILD['owner']}/{_GH_BUILD['repo']}"
            f"/actions/runs?per_page=10")
-    headers = {
-        "Accept":               "application/vnd.github+json",
-        "Authorization":        f"Bearer {_GH_BUILD['token']}",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    _ICON = {
-        ("completed",   "success"):   "✅",
-        ("completed",   "failure"):   "❌",
-        ("completed",   "cancelled"): "🚫",
-        ("in_progress", ""):           "🔄",
-        ("queued",      ""):           "🕒",
-    }
+    headers = _gh_headers()
+
     try:
         sess = await get_http()
         async with sess.get(url, headers=headers) as resp:
@@ -1269,15 +1235,15 @@ async def cmd_build_list(e):
                 run_id = r.get("id", "")
 
                 if st in ("in_progress", "queued", "waiting"):
-                    lines.append(f"🔄 **{wf}** (`{run_id}`) — `Đang build...`\n   └ [Xem Progress]({url_run})")
+                    lines.append(f"🔄 **{wf}** ({run_id}) — Đang build...\n   └ [Xem Progress]({url_run})")
                 elif cl == "success":
                     nightly = f"https://nightly.link/{_GH_BUILD['owner']}/{_GH_BUILD['repo']}/actions/runs/{run_id}"
-                    lines.append(f"✅ **{wf}** — `Thành công`\n   └ [📥 Link tải Artifacts]({nightly})")
+                    lines.append(f"✅ **{wf}** — Thành công\n   └ [📥 Link tải Artifacts]({nightly})")
                 elif cl in ("failure", "cancelled"):
                     ico = "❌" if cl == "failure" else "🚫"
-                    lines.append(f"{ico} **{wf}** — `{cl}`\n   └ [Xem chi tiết]({url_run})")
+                    lines.append(f"{ico} **{wf}** — {cl}\n   └ [Xem chi tiết]({url_run})")
                 else:
-                    lines.append(f"❔ **{wf}** — `{st}`")
+                    lines.append(f"❔ **{wf}** — {st}")
 
             await safe_edit(e, "\n".join(lines))
     except Exception as exc:
