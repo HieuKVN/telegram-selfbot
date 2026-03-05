@@ -13,7 +13,7 @@ import unicodedata
 from datetime import datetime
 from hashlib import sha256
 from typing import Any, Optional
-from zoneinfo import ZoneInfo  # Dùng thư viện chuẩn thay cho pytz
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from dotenv import load_dotenv
@@ -43,7 +43,7 @@ API_HASH = _require("API_HASH")
 PREFIX = _require("PREFIX")
 CITY = _require("CITY")
 TZ_STR = _require("TZ")
-TZ = ZoneInfo(TZ_STR)  # Sử dụng ZoneInfo chuẩn
+TZ = ZoneInfo(TZ_STR)
 OW_KEY = os.getenv("OW_KEY", "").strip()
 VT_KEY = os.getenv("VT_KEY", "").strip()
 GH_TOKEN = os.getenv("GH_TOKEN", "").strip()
@@ -51,7 +51,7 @@ PROFILE_INTERVAL = int(_require("PROFILE_INTERVAL"))
 WEATHER_CACHE = int(_require("WEATHER_CACHE"))
 
 # ─────────────────────────────────────────────────────────────
-# Globals
+# Globals & Configs
 # ─────────────────────────────────────────────────────────────
 
 client = TelegramClient("session", API_ID, API_HASH)
@@ -59,7 +59,6 @@ client = TelegramClient("session", API_ID, API_HASH)
 _http: Optional[aiohttp.ClientSession] = None
 _weather_cache: tuple[float, Optional[dict[str, Any]]] = (0.0, None)
 _weather_lock = asyncio.Lock()
-_cancel_build_events: dict[int, asyncio.Event] = {}
 
 _last_bio = ""
 _profile_errors = 0
@@ -69,6 +68,31 @@ _start_time = time.time()
 NOTE_TAG = "📌"
 NOTES_INDEX_FILE = "notes_index.json"
 _notes_index: dict[str, dict[str, Any]] = {}
+
+# --- GKI Builder Configs ---
+_GH_BUILD = {
+    "token": GH_TOKEN,
+    "owner": "HieuKVN",
+    "repo":  "GKI_KernelSU_SUSFS",
+    "ref":   "dev",
+    "workflows": {
+        "a12": "kernel-a12-5-10.yml",
+        "a13": "kernel-a13-5-15.yml",
+        "a14": "kernel-a14-6-1.yml",
+        "a15": "kernel-a15-6-6.yml",
+        "custom": "kernel-custom.yml",
+    },
+}
+
+_KER  = ["a12", "a13", "a14", "a15", "custom"]
+_VAR  = ["Official", "Next", "MKSU", "SukiSU", "ReSukiSU"]
+_BRA  = ["Stable(标准)", "Dev(开发)", "Other(其他/指定)"]
+_AV   = ["android12", "android13", "android14", "android15"]
+_KV   = ["5.10", "5.15", "6.1", "6.6"]
+
+_build_sessions: dict[int, dict] = {}
+_own_msgs:        set[int]       = set()
+_cancel_build_events: dict[int, asyncio.Event] = {}
 
 # ─────────────────────────────────────────────────────────────
 # Helpers
@@ -84,7 +108,7 @@ def _normalize(name: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", name).casefold().split())
 
 def _esc(s: str) -> str:
-    return s.replace("`", "｀")  # Đã sửa lỗi replace string rỗng
+    return s.replace("`", "｀")
 
 async def safe_edit(e, text: str) -> None:
     try:
@@ -269,7 +293,6 @@ HELP = "\n".join(
         f"`{PREFIX}virus`   — VirusTotal lookup",
         f"`{PREFIX}rebio`   — force bio update",
         f"`{PREFIX}reload`  — restart bot",
-        f"`{PREFIX}miui <model>` — MIUI firmware versions",
         "",
         "**Save / Send:**",
         f"`{PREFIX}save <name>`          — save replied msg",
@@ -279,9 +302,9 @@ HELP = "\n".join(
         f"`{PREFIX}rename <old> | <new>` — rename a saved note",
         "",
         "**GKI Builder:**",
-        f"`{PREFIX}build`   — start build wizard",
-        f"`{PREFIX}list`    — list GitHub runs",
-        f"`{PREFIX}stop`    — cancel current/monitoring build",
+        f"`{PREFIX}gki`    — start build wizard",
+        f"`{PREFIX}list`   — list GitHub runs",
+        f"`{PREFIX}stop`   — cancel current/monitoring build",
     ]
 )
 
@@ -568,200 +591,9 @@ async def cmd_delnote(e):
 
     await _reply(e, f"Deleted: {_esc(arg)}")
 
-_LATEST_YML = "https://raw.githubusercontent.com/XiaomiFirmwareUpdater/miui-updates-tracker/master/data/latest.yml"
-
-@client.on(events.NewMessage(pattern=pat("miui"), outgoing=True))
-async def cmd_miui(e):
-    arg = (e.pattern_match.group(1) or "").strip().lower()
-    parts = arg.split()
-    model = parts[0] if parts else ""
-    region_filter = parts[1] if len(parts) > 1 else "cn"  # default CN
-
-    _REGION_MAP = {
-        "cn": "china", "global": "global", "eea": "eea",
-        "in": "india",  "ru": "russia",  "tr": "turkey",
-        "tw": "taiwan", "id": "indonesia",
-    }
-    _VALID_REGIONS = tuple(_REGION_MAP)
-    if not model:
-        return await _reply(e, f"Usage: {PREFIX}miui <model> [{'|'.join(_VALID_REGIONS)}]")
-    if region_filter not in _VALID_REGIONS:
-        return await _reply(e, f"Usage: {PREFIX}miui <model> [{'|'.join(_VALID_REGIONS)}]")
-
-    await e.edit(f"🔍 Fetching firmware for {model}{' (' + region_filter + ')' if region_filter else ''}…")
-
-    try:
-        yml_text = await _fetch_text(_LATEST_YML, timeout=aiohttp.ClientTimeout(total=20))
-        if not yml_text:
-            return await safe_edit(e, "Failed to fetch firmware list.")
-    except Exception as exc:
-        return await safe_edit(e, f"Request failed: {exc}")
-
-    if f"codename: {model}" not in yml_text:
-        return await safe_edit(e, f"Model {model} not found.")
-
-    def _os_gen(ver: str) -> str:
-        v = ver.upper()
-        if v.startswith("OS3"): return "OS3"
-        if v.startswith("OS2"): return "OS2"
-        if v.startswith("OS1"): return "OS1"
-        return "MIUI"
-
-    def _yml_field(block: str, key: str) -> str:
-        m = re.search(rf"(?:^|\n)\s*{key}:\s*['\"]?([^'\"\n]+)['\"]?", block)
-        return m.group(1).strip() if m else ""
-
-    raw_blocks = re.split(r"\n(?=- android:)", yml_text)
-    device_name = model
-
-    best_stable: dict[str, dict] = {}
-    best_any:    dict[str, dict] = {}
-
-    def _update_best(store: dict[str, dict], gen: str, candidate: dict) -> None:
-        existing = store.get(gen)
-        if existing is None:
-            store[gen] = candidate
-        else:
-            try:
-                if float(candidate.get("android") or 0) >= float(existing.get("android") or 0):
-                    store[gen] = candidate
-            except ValueError:
-                pass
-
-    for blk in raw_blocks:
-        if f"codename: {model}" not in blk:
-            continue
-        if _yml_field(blk, "method").lower() != "recovery":
-            continue
-        ver_str = _yml_field(blk, "version")
-        if not ver_str:
-            continue
-        android = _yml_field(blk, "android")
-        link    = _yml_field(blk, "link")
-        name    = _yml_field(blk, "name")
-        size    = _yml_field(blk, "size")
-        date    = _yml_field(blk, "date")
-        branch  = _yml_field(blk, "branch")
-
-        if device_name == model and name:
-            device_name = re.sub(r"\s+(China|Global|India|Russia|Taiwan|Turkey|Indonesia|EEA|Japan|DC|EU)$", "", name, flags=re.IGNORECASE).strip()
-
-        name_lower = name.lower()
-        region_kw = _REGION_MAP[region_filter]
-        if region_kw not in name_lower:
-            continue
-
-        gen = _os_gen(ver_str)
-        candidate = {
-            "os": ver_str, "android": android, "release": date,
-            "link": link, "size": size, "gen": gen, "branch": branch,
-        }
-        _update_best(best_any, gen, candidate)
-        if branch.lower() == "stable":
-            _update_best(best_stable, gen, candidate)
-
-    # ── Source 2: hyperos.fans (HyperOS OS1/OS2/OS3 full history) ────────────
-    _HYPEROS_API = "https://data.hyperos.fans/devices/{}.json"
-    base_model = model.split("_")[0]
-    try:
-        hdata = await _fetch_json(_HYPEROS_API.format(base_model), timeout=aiohttp.ClientTimeout(total=10))
-        if hdata:
-            branches = hdata.get("branches") or []
-            for br in branches:
-                br_region = br.get("region", "")
-                tagmap = {"cn": "cn", "global": "global", "eea": "eea",
-                          "in": "in", "ru": "ru", "tr": "tr", "tw": "tw", "id": "id"}
-                if br_region != tagmap.get(region_filter, region_filter):
-                    continue
-                is_stable = br.get("branchtag") == "F"
-                roms = br.get("roms") or {}
-                for ver_str, info in roms.items():
-                    gen = _os_gen(ver_str)
-                    if gen == "MIUI":
-                        continue
-                    android  = info.get("android") or ""
-                    rec_file = info.get("recovery") or ""
-                    rel_date = info.get("release") or ""
-                    link = f"https://bigota.d.miui.com/{ver_str}/{rec_file}" if rec_file else ""
-                    if not link and info.get("fastboot"):
-                        fb = info["fastboot"]
-                        link = f"https://bigota.d.miui.com/{ver_str}/{fb}"
-                    br_label = "Stable" if is_stable else "Beta"
-                    candidate = {
-                        "os": ver_str, "android": android, "release": rel_date,
-                        "link": link, "size": "", "gen": gen, "branch": br_label,
-                    }
-                    _update_best(best_any, gen, candidate)
-                    if is_stable:
-                        _update_best(best_stable, gen, candidate)
-    except Exception:
-        pass
-
-    gen_best = {**best_any, **best_stable}
-
-    def _av_key(d: dict) -> float:
-        try:
-            return float(d.get("android") or 0)
-        except ValueError:
-            return 0.0
-
-    sorted_entries = sorted(gen_best.values(), key=_av_key)
-
-    if not sorted_entries:
-        return await safe_edit(e, f"No stable firmware found for {model}{' (' + region_filter + ')' if region_filter else ''}.")
-
-    region_label = f" ({region_filter.upper()})" if region_filter else ""
-    header = f"**Latest firmware for {device_name} ({model}){region_label}:**"
-    rows = [header]
-    for d in sorted_entries:
-        ver     = d.get("os", "")
-        android = d.get("android", "")
-        release = d.get("release", "")
-        link    = d.get("link", "")
-        size    = d.get("size", "")
-
-        branch_label = d.get("branch", "Stable")
-        ver_text = f"**[{ver}]({link})**" if link else f"**{ver}**"
-        row = f"› {ver_text} ({branch_label})"
-        sub = []
-        if android:
-            sub.append(f"Android: {android}")
-        if release:
-            sub.append(release)
-        if size:
-            sub.append(size)
-        if sub:
-            row += f"\n  └ {' | '.join(sub)}"
-        rows.append(row)
-
-    await safe_edit(e, "\n\n".join(rows))
-
-
 # ─────────────────────────────────────────────────────────────
 # GKI Kernel Builder
 # ─────────────────────────────────────────────────────────────
-
-_GH_BUILD = {
-    "token": GH_TOKEN,
-    "owner": "HieuKVN",
-    "repo":  "GKI_KernelSU_SUSFS",
-    "ref":   "dev",
-    "workflows": {
-        "a12": "kernel-a12-5-10.yml",
-        "a13": "kernel-a13-5-15.yml",
-        "a14": "kernel-a14-6-1.yml",
-        "a15": "kernel-a15-6-6.yml",
-        "custom": "kernel-custom.yml",
-    },
-}
-
-_build_sessions: dict[int, dict] = {}
-_own_msgs:        set[int]        = set()
-_KER  = ["a12", "a13", "a14", "a15", "custom"]
-_VAR  = ["Official", "Next", "MKSU", "SukiSU", "ReSukiSU"]
-_BRA  = ["Stable(标准)", "Dev(开发)", "Other(其他/指定)"]
-_AV   = ["android12", "android13", "android14", "android15"]
-_KV   = ["5.10", "5.15", "6.1", "6.6"]
 
 def _gh_headers() -> dict[str, str]:
     return {
@@ -803,7 +635,7 @@ async def _build_send(chat_id: int, text: str) -> None:
     s["_mid"] = msg.id
     _own_msgs.add(msg.id)
 
-@client.on(events.NewMessage(pattern=pat("build"), outgoing=True))
+@client.on(events.NewMessage(pattern=pat("gki"), outgoing=True))
 async def cmd_build(e):
     chat_id = e.chat_id
     if chat_id in _build_sessions:
@@ -831,6 +663,12 @@ async def _build_input(e):
     s = _build_sessions[chat_id]
     step = s["step"]
     raw = (e.raw_text or "").strip()
+
+    # Automatically delete the user's input message
+    try:
+        await e.delete()
+    except Exception:
+        pass
 
     if raw.lower() == "q":
         _build_sessions.pop(chat_id, None)
